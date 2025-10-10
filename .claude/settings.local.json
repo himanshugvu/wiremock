@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mvn clean:*)",
+      "Bash(mvn test:*)",
+      "Bash(tee:*)",
+      "Bash(find:*)",
+      "Bash(awk:*)",
+      "Bash(for file in src/test/java/com/orchestrator/wiremock/tests/*Test.java)",
+      "Bash(done)",
+      "Bash(for file in *.java)",
+      "Bash(do echo \"=== $file ===\")"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

@@ -1,0 +1,43 @@
+server:
+  port: 0
+
+spring:
+  application:
+    name: wiremock-integration-tests
+
+# Apache HttpClient5 Configuration for Testing
+http:
+  client:
+    connection:
+      pool:
+        max-total: 50
+        max-per-route: 20
+        validate-after-inactivity-ms: 1000
+        evict-idle-connections-after-ms: 5000
+      timeout:
+        connect-ms: 2000
+        socket-ms: 3000
+        connection-request-ms: 500
+      retry:
+        enabled: true
+        count: 2
+        interval-ms: 500
+      keep-alive:
+        enabled: true
+        duration-ms: 5000
+      stale-connection-check: true
+
+# Actuator endpoints
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics,prometheus
+
+# Logging
+logging:
+  level:
+    root: INFO
+    org.apache.hc.client5: DEBUG
+    com.orchestrator: DEBUG
+    org.wiremock: INFO
