@@ -1,48 +1,23 @@
-server:
-  port: 8080
-
-spring:
-  application:
-    name: wiremock-integration-tests
-
-# Apache HttpClient5 Configuration
-http:
-  client:
-    connection:
-      pool:
-        max-total: 200
-        max-per-route: 50
-        validate-after-inactivity-ms: 2000
-        evict-idle-connections-after-ms: 60000
-      timeout:
-        connect-ms: 3000
-        socket-ms: 5000
-        connection-request-ms: 1000
-      retry:
-        enabled: true
-        count: 3
-        interval-ms: 1000
-      keep-alive:
-        enabled: true
-        duration-ms: 30000
-      stale-connection-check: true
-
-# Actuator endpoints
-management:
-  endpoints:
-    web:
-      exposure:
-        include: health,metrics,prometheus
-  metrics:
-    export:
-      prometheus:
-        enabled: true
-
-# Logging
-logging:
-  level:
-    root: INFO
-    org.apache.hc.client5: DEBUG
-    com.orchestrator: DEBUG
-  pattern:
-    console: "%d{yyyy-MM-dd HH:mm:ss} - %msg%n"
+kafka:
+  consumer:
+    bootstrap-servers: prod-broker1:9092,prod-broker2:9092
+    group-id: payments-consumer
+    topic: payments-topic
+    concurrency: 8
+    enable-auto-commit: false
+    auto-offset-reset: earliest
+    batch-enabled: true
+    session-timeout-ms: 45000
+    heartbeat-interval-ms: 15000
+    max-poll-interval-ms: 300000
+    max-poll-records: 2000
+    fetch-min-bytes: 1048576
+    fetch-max-bytes: 52428800
+    fetch-max-wait-ms: 1000
+    request-timeout-ms: 30000
+    retry-backoff-ms: 100
+    reconnect-backoff-ms: 1000
+    client-id: ${CLUSTER_ID}-${HOSTNAME}
+    group-instance-id: ${CLUSTER_ID}-${HOSTNAME}
+    extra:
+      isolation.level: read_committed
