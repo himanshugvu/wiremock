@@ -5,10 +5,15 @@ import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
+import org.springframework.dao.DataAccessException;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.BatchPreparedStatementSetter;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.kafka.annotation.KafkaListener;
@@ -19,8 +24,7 @@ import org.springframework.kafka.listener.ContainerProperties;
 import org.springframework.kafka.support.Acknowledgment;
 import org.springframework.stereotype.Repository;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.EnableTransactionManagement;
-import org.springframework.transaction.annotation.Isolation;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.sql.PreparedStatement;
@@ -29,21 +33,17 @@ import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * =====================================================================
  *  PaymentConsumer.java  (single-file drop-in)
- *  - High-throughput Kafka consumer with:
- *      • Single & batch processing
- *      • Virtual threads (JDK 21+) for parallel batch work
- *      • Conditional commits (commit only on success OR after error persisted)
- *      • Full traceability (topic, partition, offset, key)
- *  - JDBC error logging with strong data-integrity:
- *      • Idempotency (unique constraint, upsert semantics)
- *      • ACID transactions for single & batch inserts
+ *  - Single & Batch processing; batch uses Virtual Threads executor Bean
+ *  - No unchecked list casts (safe runtime cast and validation)
+ *  - Timed batch execution (invokeAll with timeout) -> returns reliably
+ *  - Failures are persisted (idempotent, transactional) before commit
+ *  - Full metadata (topic/partition/offset/key/value preview)
  * =====================================================================
- *
- * Place in: src/main/java/com/yourorg/kafka/PaymentConsumer.java
  */
 @Service
 public class PaymentConsumer {
@@ -53,37 +53,38 @@ public class PaymentConsumer {
     private final KafkaConsumerProperties props;
     private final PaymentService paymentService;
     private final ErrorLogBatchService errorLogBatchService;
+    private final ExecutorService batchExecutor; // injected bean
 
     public PaymentConsumer(KafkaConsumerProperties props,
                            PaymentService paymentService,
-                           ErrorLogBatchService errorLogBatchService) {
+                           ErrorLogBatchService errorLogBatchService,
+                           ExecutorService batchExecutor) {
         this.props = props;
         this.paymentService = paymentService;
         this.errorLogBatchService = errorLogBatchService;
+        this.batchExecutor = batchExecutor;
     }
 
-    @SuppressWarnings("unchecked")
     @KafkaListener(
             topics = "#{@kafkaConsumerProperties.topic}",
             containerFactory = "kafkaListenerContainerFactory"
     )
     public void consume(Object message, Acknowledgment ack) {
-        if (message instanceof List<?> rawList) {
-            List<ConsumerRecord<String, String>> batch =
-                    (List<ConsumerRecord<String, String>>) (List<?>) rawList;
+        if (message instanceof List<?> rawBatch) {
+            // Validate & cast each element safely (no unchecked list cast)
+            List<ConsumerRecord<String, String>> batch = safeBatchCast(rawBatch);
             handleBatch(batch, ack);
-        } else if (message instanceof ConsumerRecord<?, ?> generic) {
-            ConsumerRecord<String, String> record =
-                    (ConsumerRecord<String, String>) (ConsumerRecord<?, ?>) generic;
-            handleSingle(record, ack);
+        } else if (message instanceof ConsumerRecord<?, ?> raw) {
+            ConsumerRecord<String, String> rec = safeRecordCast(raw);
+            handleSingle(rec, ack);
         } else {
             log.error("Unsupported payload type received by consumer: {}", message == null ? "null" : message.getClass());
         }
     }
 
-    // ------------------------------------------------------------------
-    // SINGLE: Commit only if processed OR error row persisted transactionally
-    // ------------------------------------------------------------------
+    // ---------------------------------------------------------
+    // SINGLE MESSAGE: commit only if processed OR error persisted
+    // ---------------------------------------------------------
     private void handleSingle(ConsumerRecord<String, String> record, Acknowledgment ack) {
         try {
             paymentService.processPayment(record);
@@ -95,7 +96,7 @@ public class PaymentConsumer {
             ErrorRecord err = ErrorRecord.single(record, processingEx);
 
             try {
-                errorLogBatchService.insertSingle(err);   // transactional + idempotent
+                errorLogBatchService.insertSingle(err); // transactional + idempotent
                 log.warn("Error persisted; committing offset (offset={}).", record.offset());
                 ack.acknowledge();
             } catch (Exception errorInsertEx) {
@@ -105,51 +106,77 @@ public class PaymentConsumer {
         }
     }
 
-    // ------------------------------------------------------------------
-    // BATCH: Parallel process, collect failures, bulk-insert errors atomically, commit end
-    // ------------------------------------------------------------------
+    // ---------------------------------------------------------
+    // BATCH: parallel process with timeout; bulk persist errors; commit end
+    // ---------------------------------------------------------
     private void handleBatch(List<ConsumerRecord<String, String>> records, Acknowledgment ack) {
         if (records.isEmpty()) {
             ack.acknowledge();
             return;
         }
 
-        Set<Integer> partitions = new HashSet<>();
-        for (ConsumerRecord<String, String> r : records) partitions.add(r.partition());
+        // NOTE: A batch can contain records from MULTIPLE partitions — not guaranteed single partition.
+        Set<Integer> partitions = uniquePartitions(records);
+        log.info("Processing batch: size={}, topic={}, partitions={}", records.size(), records.get(0).topic(), partitions);
 
-        log.info("Processing batch: size={}, topic={}, partitions={}",
-                records.size(), records.get(0).topic(), partitions);
-
+        // Collect failures (including timeouts)
         ConcurrentLinkedQueue<ErrorRecord> errorQueue = new ConcurrentLinkedQueue<>();
 
-        try (ExecutorService exec = Executors.newVirtualThreadPerTaskExecutor()) {
-            List<Callable<Void>> tasks = records.stream()
-                    .map(rec -> (Callable<Void>) () -> {
-                        try {
-                            paymentService.processPayment(rec);
-                        } catch (Exception ex) {
-                            log.error("Batch record failed: topic={}, partition={}, offset={}",
-                                    rec.topic(), rec.partition(), rec.offset(), ex);
-                            errorQueue.add(ErrorRecord.batch(rec, ex));
-                        }
-                        return null;
-                    })
-                    .toList();
+        // Prepare tasks (keep original order so futures index => record index)
+        List<Callable<Void>> tasks = new ArrayList<>(records.size());
+        for (ConsumerRecord<String, String> rec : records) {
+            tasks.add(() -> {
+                try {
+                    paymentService.processPayment(rec);
+                } catch (Exception ex) {
+                    log.error("Batch record failed. topic={}, partition={}, offset={}, key={}",
+                            rec.topic(), rec.partition(), rec.offset(), rec.key(), ex);
+                    errorQueue.add(ErrorRecord.batch(rec, ex));
+                }
+                return null;
+            });
+        }
 
-            exec.invokeAll(tasks);
+        // Compute a safe timeout (don't exceed max.poll.interval.ms)
+        long configured = props.getBatchProcessTimeoutMs();
+        long safetyCap = Math.max(1_000L, props.getMaxPollIntervalMs() - 2_000L);
+        long timeoutMs = Math.min(configured, safetyCap);
+
+        try {
+            List<Future<Void>> futures = batchExecutor.invokeAll(tasks, timeoutMs, TimeUnit.MILLISECONDS);
+
+            // Handle any timeouts/cancellations
+            for (int i = 0; i < futures.size(); i++) {
+                Future<Void> f = futures.get(i);
+                if (!f.isDone()) {
+                    // Cancel and record a timeout error
+                    f.cancel(true);
+                    ConsumerRecord<String, String> rec = records.get(i);
+                    log.error("Batch task timed out after {} ms. topic={}, partition={}, offset={}",
+                              timeoutMs, rec.topic(), rec.partition(), rec.offset());
+                    errorQueue.add(ErrorRecord.timeout(rec, timeoutMs));
+                } else {
+                    try {
+                        f.get(); // surface any thrown exception (already captured above)
+                    } catch (ExecutionException ee) {
+                        // already captured in errorQueue in the task; just log
+                        log.debug("Task completed exceptionally (already captured): {}", ee.getCause() == null ? ee : ee.getCause().getMessage());
+                    }
+                }
+            }
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
             throw new RuntimeException("Batch execution interrupted", ie);
         }
 
-        // Persist all failures atomically (transaction); only then commit offsets
+        // Persist all failures (if any) atomically; only then commit
         if (!errorQueue.isEmpty()) {
             List<ErrorRecord> toInsert = new ArrayList<>(errorQueue);
             try {
                 errorLogBatchService.insertBatch(toInsert);  // transactional + idempotent
                 log.warn("Batch error persistence succeeded; count={}", toInsert.size());
             } catch (Exception batchInsertEx) {
-                log.error("Batch error persistence failed; NOT committing offsets", batchInsertEx);
+                log.error("Batch error persistence failed; NOT committing offsets.", batchInsertEx);
                 throw new RuntimeException("Batch error persistence failed — no commit", batchInsertEx);
             }
         }
@@ -157,10 +184,45 @@ public class PaymentConsumer {
         ack.acknowledge();
         log.info("Batch committed successfully: size={}", records.size());
     }
+
+    // ---------- helpers ----------
+
+    /** Safe per-element cast with validation; no unchecked list cast. */
+    private static ConsumerRecord<String, String> safeRecordCast(Object obj) {
+        if (!(obj instanceof ConsumerRecord<?, ?> raw)) {
+            throw new IllegalArgumentException("Listener expected ConsumerRecord but got: " + (obj == null ? "null" : obj.getClass()));
+        }
+        Object k = raw.key();
+        Object v = raw.value();
+        if (k != null && !(k instanceof String)) {
+            throw new IllegalArgumentException("Expected String key but got: " + k.getClass());
+        }
+        if (v != null && !(v instanceof String)) {
+            throw new IllegalArgumentException("Expected String value but got: " + v.getClass());
+        }
+        @SuppressWarnings("unchecked")
+        ConsumerRecord<String, String> typed = (ConsumerRecord<String, String>) raw;
+        return typed;
+    }
+
+    /** Validate batch contents and cast each record safely. */
+    private static List<ConsumerRecord<String, String>> safeBatchCast(List<?> rawBatch) {
+        List<ConsumerRecord<String, String>> out = new ArrayList<>(rawBatch.size());
+        for (Object o : rawBatch) {
+            out.add(safeRecordCast(o));
+        }
+        return out;
+    }
+
+    private static Set<Integer> uniquePartitions(List<ConsumerRecord<String, String>> records) {
+        Set<Integer> parts = new HashSet<>();
+        for (ConsumerRecord<String, String> r : records) parts.add(r.partition());
+        return parts;
+    }
 }
 
 /* =====================================================================
-   CONFIGURATION PROPERTIES (centralized, override via application.yml)
+   CONFIGURATION PROPERTIES (centralized; override via application.yml)
    ===================================================================== */
 @ConfigurationProperties(prefix = "kafka.consumer")
 class KafkaConsumerProperties {
@@ -200,10 +262,19 @@ class KafkaConsumerProperties {
     private String clientId = "default-client";
     private String groupInstanceId = "";
 
-    // Extra dynamic props passthrough
+    // Batch executor controls:
+    //  - If batchMaxParallelism <= 0 => unbounded virtual threads (per-task)
+    //  - Else => fixed-size virtual pool with that many threads
+    private int batchMaxParallelism = 0;
+
+    // Max time to wait for one polled batch to be processed before we time out tasks
+    // (Will be capped at maxPollIntervalMs - 2s at runtime)
+    private long batchProcessTimeoutMs = 240_000L; // 4 minutes by default
+
+    // Dynamic extras
     private Map<String, Object> extra = new HashMap<>();
 
-    // ---- Getters/Setters (required for @ConfigurationProperties) ----
+    // ---- Getters / Setters (required for @ConfigurationProperties) ----
     public String getBootstrapServers() { return bootstrapServers; }
     public void setBootstrapServers(String bootstrapServers) { this.bootstrapServers = bootstrapServers; }
     public String getGroupId() { return groupId; }
@@ -246,16 +317,19 @@ class KafkaConsumerProperties {
     public void setClientId(String clientId) { this.clientId = clientId; }
     public String getGroupInstanceId() { return groupInstanceId; }
     public void setGroupInstanceId(String groupInstanceId) { this.groupInstanceId = groupInstanceId; }
+    public int getBatchMaxParallelism() { return batchMaxParallelism; }
+    public void setBatchMaxParallelism(int batchMaxParallelism) { this.batchMaxParallelism = batchMaxParallelism; }
+    public long getBatchProcessTimeoutMs() { return batchProcessTimeoutMs; }
+    public void setBatchProcessTimeoutMs(long batchProcessTimeoutMs) { this.batchProcessTimeoutMs = batchProcessTimeoutMs; }
     public Map<String, Object> getExtra() { return extra; }
     public void setExtra(Map<String, Object> extra) { this.extra = extra; }
 }
 
 /* =====================================================================
-   SPRING CONFIG (consumer factory + container)
+   SPRING CONFIG (consumer factory + listener container + batch executor)
    ===================================================================== */
 @Configuration
 @EnableConfigurationProperties(KafkaConsumerProperties.class)
-@EnableTransactionManagement
 class KafkaConsumerConfig {
 
     @Bean
@@ -322,9 +396,30 @@ class KafkaConsumerConfig {
         factory.getContainerProperties().setAckMode(
                 props.isBatchEnabled()
                         ? ContainerProperties.AckMode.MANUAL          // batch → commit after full processing
-                        : ContainerProperties.AckMode.MANUAL_IMMEDIATE // single → commit immediately on ack
+                        : ContainerProperties.AckMode.MANUAL_IMMEDIATE // single → commit per record
         );
         return factory;
+    }
+
+    /**
+     * Batch executor Bean:
+     *  - If batchMaxParallelism <= 0 → "unbounded" virtual threads (per task).
+     *  - Else → fixed-size virtual pool capped by batchMaxParallelism and CPU.
+     *
+     *  The Bean's destroy method shuts it down cleanly on app stop.
+     */
+    @Bean(destroyMethod = "shutdown")
+    ExecutorService kafkaBatchExecutor(KafkaConsumerProperties props) {
+        int cap = props.getBatchMaxParallelism();
+        if (cap <= 0) {
+            // Best general default for mixed I/O workloads: virtual thread per task
+            return Executors.newVirtualThreadPerTaskExecutor();
+        } else {
+            // If your processing is CPU-heavy, cap the virtual concurrency
+            int cpu = Runtime.getRuntime().availableProcessors();
+            int threads = Math.max(1, Math.min(cap, cpu * 8)); // sane upper bound
+            return Executors.newFixedThreadPool(threads, Thread.ofVirtual().name("kafka-vt-", 0).factory());
+        }
     }
 }
 
@@ -341,17 +436,17 @@ interface ErrorLogBatchService {
 }
 
 /* =====================================================================
-   DUMMY IMPLEMENTATIONS (keep for local testing; replace in prod)
+   DUMMY IMPLEMENTATIONS (compile/run without DB; replace in prod)
    ===================================================================== */
 @Service
+@ConditionalOnMissingBean(ErrorLogBatchService.class)
 class DummyPaymentService implements PaymentService {
     private static final Logger log = LoggerFactory.getLogger(DummyPaymentService.class);
     @Override
     public void processPayment(ConsumerRecord<String, String> record) throws Exception {
-        // TODO: Replace with real business logic (validation, DB, downstream)
+        // TODO: Replace with real business logic
         log.info("Processing payment: topic={}, partition={}, offset={}, key={}, value={}",
                 record.topic(), record.partition(), record.offset(), record.key(), record.value());
-        // Example to simulate failure: if (record.value() != null && record.value().contains("FAIL")) throw new RuntimeException("Simulated failure");
     }
 }
 
@@ -359,36 +454,36 @@ class DummyPaymentService implements PaymentService {
    JDBC IMPLEMENTATION — Error persistence with idempotency & transactions
    Target dialect: PostgreSQL (UPSERT via ON CONFLICT DO NOTHING)
    ---------------------------------------------------------------------
-   TABLE DDL (example):
+   TABLE DDL (recommended):
    CREATE TABLE IF NOT EXISTS payment_error_log (
-       id BIGSERIAL PRIMARY KEY,
-       topic TEXT NOT NULL,
-       partition_id INT NOT NULL,
-       offset BIGINT NOT NULL,
-       record_key TEXT,
-       value_preview TEXT,
-       error_message TEXT,
+       id             BIGSERIAL PRIMARY KEY,
+       topic          TEXT        NOT NULL,
+       partition_no   INT         NOT NULL,
+       record_offset  BIGINT      NOT NULL,
+       msg_key        TEXT,
+       msg_value      TEXT,
+       error_message  TEXT,
        exception_type TEXT,
-       source TEXT NOT NULL,
-       occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-       CONSTRAINT uq_err_unique UNIQUE (topic, partition_id, offset, source)
+       source         VARCHAR(16) NOT NULL,
+       occurred_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       UNIQUE (topic, partition_no, record_offset)
    );
+   CREATE INDEX IF NOT EXISTS idx_payment_error_log_time ON payment_error_log (occurred_at DESC);
    ===================================================================== */
 @Repository
+@Primary
+@ConditionalOnBean(JdbcTemplate.class)
 class JdbcErrorLogBatchService implements ErrorLogBatchService {
 
     private static final Logger log = LoggerFactory.getLogger(JdbcErrorLogBatchService.class);
 
-    private static final String INSERT_SINGLE_PG = """
-        INSERT INTO payment_error_log
-            (topic, partition_id, offset, record_key, value_preview, error_message, exception_type, source, occurred_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT (topic, partition_id, offset, source) DO NOTHING
-        """;
+    private static final String INSERT_SQL_POSTGRES =
+            "INSERT INTO payment_error_log " +
+            " (topic, partition_no, record_offset, msg_key, msg_value, error_message, exception_type, source, occurred_at) " +
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) " +
+            " ON CONFLICT (topic, partition_no, record_offset) DO NOTHING";
 
-    private static final String INSERT_BATCH_PG = INSERT_SINGLE_PG; // same SQL; use batchUpdate
-
-    private static final int BATCH_CHUNK_SIZE = 500; // keep DB happy & fast
+    private static final int BATCH_CHUNK_SIZE = 1000; // tune per environment
 
     private final JdbcTemplate jdbc;
 
@@ -396,46 +491,46 @@ class JdbcErrorLogBatchService implements ErrorLogBatchService {
         this.jdbc = jdbc;
     }
 
-    /** Single-row insert, wrapped in a transaction for atomicity. */
+    /** Single row; idempotent (UNIQUE + DO NOTHING) and transactional. */
     @Override
-    @Transactional(isolation = Isolation.READ_COMMITTED)
+    @Transactional(propagation = Propagation.REQUIRED)
     public void insertSingle(ErrorRecord r) {
-        int updated = jdbc.update(
-                INSERT_SINGLE_PG,
-                r.getTopic(),
-                r.getPartition(),
-                r.getOffset(),
-                r.getKey(),
-                r.getValuePreview(),
-                r.getErrorMessage(),
-                r.getExceptionType(),
-                r.getSource(),
-                Timestamp.from(r.getOccurredAt())
-        );
-        if (updated == 0) {
-            // Duplicate (idempotent upsert) — already present, treat as success
-            log.info("Error row already exists (idempotent upsert). topic={}, partition={}, offset={}, source={}",
-                    r.getTopic(), r.getPartition(), r.getOffset(), r.getSource());
+        try {
+            jdbc.update(INSERT_SQL_POSTGRES,
+                    r.getTopic(),
+                    r.getPartition(),
+                    r.getOffset(),
+                    r.getKey(),
+                    r.getValuePreview(),
+                    r.getErrorMessage(),
+                    r.getExceptionType(),
+                    r.getSource(),
+                    toTs(r.getOccurredAt())
+            );
+        } catch (DuplicateKeyException dup) {
+            // Idempotency: duplicate means already logged — treat as success
+            log.debug("Duplicate error row skipped (idempotent): {}:{}:{}", r.getTopic(), r.getPartition(), r.getOffset());
+        } catch (DataAccessException dae) {
+            log.error("insertSingle failed", dae);
+            throw dae;
         }
     }
 
-    /** Batch insert with chunking; whole method is transactional for all-or-nothing semantics. */
+    /** Batch insert with chunking; whole method is transactional (all-or-nothing). */
     @Override
-    @Transactional(isolation = Isolation.READ_COMMITTED)
+    @Transactional(propagation = Propagation.REQUIRED)
     public void insertBatch(List<ErrorRecord> records) {
-        if (records == null || records.isEmpty()) {
-            return;
-        }
-        // Chunk the batch to bounded sizes
-        for (int start = 0; start < records.size(); start += BATCH_CHUNK_SIZE) {
-            final int from = start;
-            final int to = Math.min(start + BATCH_CHUNK_SIZE, records.size());
-            final List<ErrorRecord> chunk = records.subList(from, to);
+        if (records == null || records.isEmpty()) return;
 
-            jdbc.batchUpdate(INSERT_BATCH_PG, new BatchPreparedStatementSetter() {
+        final int size = records.size();
+        for (int start = 0; start < size; start += BATCH_CHUNK_SIZE) {
+            final int end = Math.min(start + BATCH_CHUNK_SIZE, size);
+            final List<ErrorRecord> slice = records.subList(start, end);
+
+            jdbc.batchUpdate(INSERT_SQL_POSTGRES, new BatchPreparedStatementSetter() {
                 @Override
                 public void setValues(PreparedStatement ps, int i) throws SQLException {
-                    ErrorRecord r = chunk.get(i);
+                    ErrorRecord r = slice.get(i);
                     ps.setString(1, r.getTopic());
                     ps.setInt(2, r.getPartition());
                     ps.setLong(3, r.getOffset());
@@ -444,12 +539,15 @@ class JdbcErrorLogBatchService implements ErrorLogBatchService {
                     ps.setString(6, r.getErrorMessage());
                     ps.setString(7, r.getExceptionType());
                     ps.setString(8, r.getSource());
-                    ps.setTimestamp(9, Timestamp.from(r.getOccurredAt()));
+                    ps.setTimestamp(9, toTs(r.getOccurredAt()));
                 }
-                @Override
-                public int getBatchSize() { return chunk.size(); }
+                @Override public int getBatchSize() { return slice.size(); }
             });
         }
+    }
+
+    private static Timestamp toTs(Instant instant) {
+        return Timestamp.from(instant == null ? Instant.now() : instant);
     }
 }
 
@@ -465,7 +563,7 @@ final class ErrorRecord {
     private final String valuePreview;   // truncated to prevent bloating
     private final String errorMessage;   // truncated
     private final String exceptionType;
-    private final String source;         // "SINGLE" | "BATCH"
+    private final String source;         // "SINGLE" | "BATCH" | "TIMEOUT"
     private final Instant occurredAt;
 
     private ErrorRecord(ConsumerRecord<String, String> rec, Exception ex, String source) {
@@ -488,12 +586,16 @@ final class ErrorRecord {
         return new ErrorRecord(rec, ex, "BATCH");
     }
 
+    static ErrorRecord timeout(ConsumerRecord<String, String> rec, long timeoutMs) {
+        return new ErrorRecord(rec, new TimeoutException("Processing timed out after " + timeoutMs + " ms"), "TIMEOUT");
+    }
+
     private static String truncate(String s, int max) {
         if (s == null) return null;
         return s.length() <= max ? s : s.substring(0, max) + "...";
     }
 
-    // ---- Getters (used by JDBC layer) ----
+    // ---- Getters (used by JDBC binder) ----
     public String getTopic() { return topic; }
     public int getPartition() { return partition; }
     public long getOffset() { return offset; }
