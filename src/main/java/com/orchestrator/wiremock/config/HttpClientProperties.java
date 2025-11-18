@@ -7,6 +7,8 @@ import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.clients.producer.RecordMetadata;
+import org.apache.kafka.common.errors.RetriableException;
 import org.apache.kafka.common.header.Header;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
@@ -31,7 +33,10 @@ import org.springframework.stereotype.Repository;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.util.concurrent.ListenableFuture;
 
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.nio.charset.StandardCharsets;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
@@ -40,16 +45,16 @@ import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.stream.Collectors;
-import java.util.stream.StreamSupport;
 
 /**
  * =====================================================================
  *  PaymentConsumer.java  (single-file drop-in)
- *  - Consumes records and PRODUCES a Kafka message per record (async)
- *  - Commits only after send success OR (on failure) error persisted
- *  - Batch: parallel on virtual threads; wait for all sends; bulk error insert; commit at end
- *  - Strong producer settings: idempotence, acks=all, retries, compression, batching
- *  - Metrics (Micrometer): send latency, counts, DB timing, commits, timeouts
+ *  - Consume -> async PRODUCE per record (returns ProduceOutcome)
+ *  - Hybrid timeouts: per-record AND global batch cap
+ *  - Commit only after send success OR (on failure) after error persisted
+ *  - Batch: virtual-thread fan-out; wait bounded; bulk error insert; commit
+ *  - Producer: idempotence, acks=all, retries, backoff, batching, compression
+ *  - Metrics (Micrometer): send/consume latency, counts, DB timing, timeouts
  * =====================================================================
  */
 @Service
@@ -59,7 +64,7 @@ public class PaymentConsumer {
 
     private final KafkaConsumerProperties consumerProps;
     private final KafkaProducerProperties producerProps;
-    private final PaymentService paymentService;               // now produces to Kafka
+    private final PaymentService paymentService;               // produces to Kafka and returns ProduceOutcome
     private final ErrorLogBatchService errorLogBatchService;   // DB error store (idempotent)
     private final ExecutorService batchExecutor;               // virtual-thread executor bean
     private final MeterRegistry metrics;
@@ -96,57 +101,63 @@ public class PaymentConsumer {
 
     // ------------------------------------------------------------------
     // SINGLE: produce async; ack only after send success OR error persisted
-    //  (No DB logic inside catch; we capture failure and act afterwards.)
     // ------------------------------------------------------------------
     private void handleSingle(ConsumerRecord<String, String> record, Acknowledgment ack) {
         Timer.Sample sample = Timer.start(metrics);
 
-        // Start async produce for this record (may be 1..N sends; combined future completes when all done)
-        CompletableFuture<Void> sendFuture = paymentService.processPayment(record);
+        CompletableFuture<ProduceOutcome> future = paymentService.processPayment(record);
 
-        // Wait bounded time for async send (don’t exceed poll interval)
-        long timeoutMs = Math.min(
+        long perRecordBudget = Math.min(
                 producerProps.getSendTimeoutMs(),
                 Math.max(1_000L, consumerProps.getMaxPollIntervalMs() - 2_000L)
         );
 
-        Throwable failure = await(sendFuture, timeoutMs);
+        ProduceOutcome result;
+        String outcomeTag;
+        try {
+            result = future.get(perRecordBudget, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException te) {
+            result = ProduceOutcome.failure(producerProps.getTargetTopic(), te, true);
+        } catch (ExecutionException ee) {
+            result = ProduceOutcome.failure(producerProps.getTargetTopic(), rootCause(ee), false);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            result = ProduceOutcome.failure(producerProps.getTargetTopic(), ie, true);
+        }
 
-        String resultTag;
-        if (failure == null) {
+        if (result.isSuccess()) {
             ack.acknowledge();
-            resultTag = "sent";
+            outcomeTag = "sent";
             metrics.counter("kafka.consumer.commits", "mode", "single", "topic", record.topic()).increment();
         } else {
-            // Persist error row; commit only if persistence succeeded
-            log.error("Single produce failed; attempting error persistence. topic={}, partition={}, offset={}, key={}",
-                    record.topic(), record.partition(), record.offset(), record.key(), failure);
+            log.error("Single produce failed; attempting error persistence. topic={}, partition={}, offset={}, key={}, errType={}, retriable={}",
+                    record.topic(), record.partition(), record.offset(), record.key(),
+                    result.getExceptionType(), result.isRetriable());
 
-            ErrorRecord err = ErrorRecord.single(record, failure);
+            ErrorRecord err = ErrorRecord.fromOutcome(record, result, "SINGLE");
             boolean persisted = persistSingleError(err);
 
             if (persisted) {
                 ack.acknowledge();
-                resultTag = "error_logged";
+                outcomeTag = "error_logged";
                 metrics.counter("kafka.consumer.commits", "mode", "single", "topic", record.topic()).increment();
             } else {
-                resultTag = "error_persist_failed";
+                outcomeTag = "error_persist_failed";
                 sample.stop(Timer.builder("kafka.consumer.process.latency")
-                        .tag("mode", "single").tag("topic", record.topic()).tag("result", resultTag)
+                        .tag("mode", "single").tag("topic", record.topic()).tag("result", outcomeTag)
                         .register(metrics));
-                throw new RuntimeException("Produce failed and error persistence failed — no commit", failure);
+                throw new RuntimeException("Produce failed and error persistence failed — no commit: " + result.getErrorMessage());
             }
         }
 
-        // Metrics: end-to-end latency for single path
         sample.stop(Timer.builder("kafka.consumer.process.latency")
-                .tag("mode", "single").tag("topic", record.topic()).tag("result", resultTag)
+                .tag("mode", "single").tag("topic", record.topic()).tag("result", outcomeTag)
                 .register(metrics));
-        metrics.counter("kafka.consumer.messages", "mode", "single", "topic", record.topic(), "result", resultTag).increment();
+        metrics.counter("kafka.consumer.messages", "mode", "single", "topic", record.topic(), "result", outcomeTag).increment();
     }
 
     // ------------------------------------------------------------------
-    // BATCH: parallel async produce; wait with timeout; bulk error insert; commit end
+    // BATCH: parallel async produce; per-record timeout; global cap; bulk error insert; commit end
     // ------------------------------------------------------------------
     private void handleBatch(List<ConsumerRecord<String, String>> records, Acknowledgment ack) {
         if (records.isEmpty()) {
@@ -161,22 +172,42 @@ public class PaymentConsumer {
         Timer.Sample batchSample = Timer.start(metrics);
         ConcurrentLinkedQueue<ErrorRecord> errors = new ConcurrentLinkedQueue<>();
 
-        // Build callable tasks: each task blocks (on a virtual thread) for its record’s async send to complete
+        // Global cap (safety net) so we never exceed poll interval
+        final long globalTimeoutMs = Math.min(
+                consumerProps.getBatchProcessTimeoutMs(),
+                Math.max(1_000L, consumerProps.getMaxPollIntervalMs() - 2_000L)
+        );
+
+        // Per-record budget (fail fast for stragglers) AND never exceed the global cap
+        long perRecordTimeoutMs = Math.min(
+                producerProps.getSendTimeoutMs(),
+                globalTimeoutMs > 1_000L ? globalTimeoutMs - 500L : globalTimeoutMs
+        );
+        perRecordTimeoutMs = Math.max(500L, perRecordTimeoutMs); // floor
+
         List<Callable<Void>> tasks = new ArrayList<>(records.size());
         for (ConsumerRecord<String, String> rec : records) {
             tasks.add(() -> {
                 Timer.Sample msgSample = Timer.start(metrics);
                 String res = "sent";
                 try {
-                    CompletableFuture<Void> sendFut = paymentService.processPayment(rec);
-                    long timeoutMs = Math.min(
-                            producerProps.getSendTimeoutMs(),
-                            Math.max(1_000L, consumerProps.getMaxPollIntervalMs() - 2_000L)
-                    );
-                    Throwable f = await(sendFut, timeoutMs);
-                    if (f != null) {
+                    CompletableFuture<ProduceOutcome> f = paymentService.processPayment(rec);
+
+                    ProduceOutcome pr;
+                    try {
+                        pr = f.get(perRecordTimeoutMs, TimeUnit.MILLISECONDS);
+                    } catch (TimeoutException te) {
+                        pr = ProduceOutcome.failure(producerProps.getTargetTopic(), te, true);
+                    } catch (ExecutionException ee) {
+                        pr = ProduceOutcome.failure(producerProps.getTargetTopic(), rootCause(ee), false);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        pr = ProduceOutcome.failure(producerProps.getTargetTopic(), ie, true);
+                    }
+
+                    if (!pr.isSuccess()) {
                         res = "failed";
-                        errors.add(ErrorRecord.batch(rec, f));
+                        errors.add(ErrorRecord.fromOutcome(rec, pr, "BATCH"));
                     }
                 } finally {
                     msgSample.stop(Timer.builder("kafka.consumer.process.latency")
@@ -188,21 +219,15 @@ public class PaymentConsumer {
             });
         }
 
-        // Global cap so we never exceed poll interval
-        long globalTimeoutMs = Math.min(
-                consumerProps.getBatchProcessTimeoutMs(),
-                Math.max(1_000L, consumerProps.getMaxPollIntervalMs() - 2_000L)
-        );
-
         try {
             List<Future<Void>> futures = batchExecutor.invokeAll(tasks, globalTimeoutMs, TimeUnit.MILLISECONDS);
 
-            // Any not-done → treat as timeout failure
+            // Any not-done → treat as timeout failure (create synthetic failure outcome)
             int timeouts = 0;
             for (int i = 0; i < futures.size(); i++) {
                 Future<Void> f = futures.get(i);
                 if (!f.isDone()) {
-                    f.cancel(true);
+                    f.cancel(true); // interrupts the virtual thread
                     ConsumerRecord<String, String> rec = records.get(i);
                     errors.add(ErrorRecord.timeout(rec, globalTimeoutMs));
                     timeouts++;
@@ -243,31 +268,10 @@ public class PaymentConsumer {
 
     // ---------- helpers ----------
 
-    /** Wait for a CompletionStage up to timeout; return null on success, otherwise the failure (TimeoutException on timeouts). */
-    private static Throwable await(CompletionStage<?> stage, long timeoutMs) {
-        try {
-            stage.toCompletableFuture().get(timeoutMs, TimeUnit.MILLISECONDS);
-            return null;
-        } catch (TimeoutException te) {
-            return te;
-        } catch (ExecutionException ee) {
-            return ee.getCause() == null ? ee : ee.getCause();
-        } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
-            return ie;
-        }
-    }
-
-    /** Persist a single error row; return true on success (idempotent), false on failure. */
-    private boolean persistSingleError(ErrorRecord row) {
-        try {
-            errorLogBatchService.insertSingle(row);
-            return true;
-        } catch (Exception dbEx) {
-            log.error("Persisting single error row failed. topic={}, partition={}, offset={}",
-                    row.getTopic(), row.getPartition(), row.getOffset(), dbEx);
-            return false;
-        }
+    private static Throwable rootCause(Throwable t) {
+        Throwable cur = t;
+        while (cur.getCause() != null && cur.getCause() != cur) cur = cur.getCause();
+        return cur;
     }
 
     /** Safe per-element cast with validation; no unchecked list cast. */
@@ -290,6 +294,18 @@ public class PaymentConsumer {
         List<ConsumerRecord<String, String>> out = new ArrayList<>(rawBatch.size());
         for (Object o : rawBatch) out.add(safeRecordCast(o));
         return out;
+    }
+
+    /** Persist a single error row; return true on success (idempotent), false on failure. */
+    private boolean persistSingleError(ErrorRecord row) {
+        try {
+            errorLogBatchService.insertSingle(row);
+            return true;
+        } catch (Exception dbEx) {
+            log.error("Persisting single error row failed. topic={}, partition={}, offset={}",
+                    row.getTopic(), row.getPartition(), row.getOffset(), dbEx);
+            return false;
+        }
     }
 }
 
@@ -330,17 +346,17 @@ class KafkaConsumerProperties {
     private int retryBackoffMs = 100;
     private int reconnectBackoffMs = 1_000;
 
-    // Identity (recommend: ${CLUSTER_ID}-${HOSTNAME})
+    // Identity
     private String clientId = "default-client";
     private String groupInstanceId = "";
 
-    // Batch time budget (will be capped by poll interval - 2s)
+    // Batch time budget (capped by poll interval - 2s)
     private long batchProcessTimeoutMs = 240_000L;
 
     // Dynamic extras
     private Map<String, Object> extra = new HashMap<>();
 
-    // getters/setters (boilerplate)
+    // getters/setters omitted for brevity (include in your code)
     public String getBootstrapServers() { return bootstrapServers; }
     public void setBootstrapServers(String bootstrapServers) { this.bootstrapServers = bootstrapServers; }
     public String getGroupId() { return groupId; }
@@ -395,7 +411,6 @@ class KafkaConsumerProperties {
 @ConfigurationProperties(prefix = "kafka.producer")
 class KafkaProducerProperties {
 
-    // Where to produce (default: reuse consumer bootstrap)
     private String bootstrapServers;
     private String targetTopic = "payments-processed";
 
@@ -403,25 +418,26 @@ class KafkaProducerProperties {
     private String acks = "all";
     private boolean idempotence = true;
     private int retries = Integer.MAX_VALUE;
-    private int maxInFlightRequestsPerConnection = 5; // safe with idempotence
+    private int maxInFlightRequestsPerConnection = 5;
+    private int retryBackoffMs = 100;
 
-    // Batching & compression for throughput
-    private int batchSizeBytes = 32 * 1024;   // 32 KiB
+    // Batching & compression
+    private int batchSizeBytes = 32 * 1024;
     private int lingerMs = 10;
-    private String compressionType = "lz4";   // or "zstd" if cluster supports
+    private String compressionType = "lz4";
 
     // Timeouts & buffers
     private int requestTimeoutMs = 30_000;
     private int deliveryTimeoutMs = 120_000;
-    private long bufferMemoryBytes = 64L * 1024 * 1024; // 64 MiB
+    private long bufferMemoryBytes = 64L * 1024 * 1024;
 
-    // Async send await timeout (per record)
+    // Await timeout (per record)
     private long sendTimeoutMs = 60_000L;
 
     // Header behavior
     private boolean copyHeaders = true;
 
-    // getters/setters
+    // getters/setters omitted for brevity (include in your code)
     public String getBootstrapServers() { return bootstrapServers; }
     public void setBootstrapServers(String bootstrapServers) { this.bootstrapServers = bootstrapServers; }
     public String getTargetTopic() { return targetTopic; }
@@ -434,6 +450,8 @@ class KafkaProducerProperties {
     public void setRetries(int retries) { this.retries = retries; }
     public int getMaxInFlightRequestsPerConnection() { return maxInFlightRequestsPerConnection; }
     public void setMaxInFlightRequestsPerConnection(int v) { this.maxInFlightRequestsPerConnection = v; }
+    public int getRetryBackoffMs() { return retryBackoffMs; }
+    public void setRetryBackoffMs(int retryBackoffMs) { this.retryBackoffMs = retryBackoffMs; }
     public int getBatchSizeBytes() { return batchSizeBytes; }
     public void setBatchSizeBytes(int batchSizeBytes) { this.batchSizeBytes = batchSizeBytes; }
     public int getLingerMs() { return lingerMs; }
@@ -511,22 +529,19 @@ class KafkaConfig {
     ProducerFactory<String, String> producerFactory(KafkaConsumerProperties consumerProps,
                                                     KafkaProducerProperties producerProps) {
         Map<String, Object> cfg = new HashMap<>();
-        // Prefer producer bootstrap if set; else reuse consumer
         cfg.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG,
                 producerProps.getBootstrapServers() != null ? producerProps.getBootstrapServers() : consumerProps.getBootstrapServers());
-
-        // Best practices for safety + throughput
-        cfg.put(ProducerConfig.ACKS_CONFIG, producerProps.getAcks());                            // all
-        cfg.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, producerProps.isIdempotence());       // true
-        cfg.put(ProducerConfig.RETRIES_CONFIG, producerProps.getRetries());                     // lots of retries
-        cfg.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, producerProps.getMaxInFlightRequestsPerConnection()); // <=5 with idempotence
-        cfg.put(ProducerConfig.COMPRESSION_TYPE_CONFIG, producerProps.getCompressionType());    // lz4/zstd
-        cfg.put(ProducerConfig.BATCH_SIZE_CONFIG, producerProps.getBatchSizeBytes());           // 32 KiB
-        cfg.put(ProducerConfig.LINGER_MS_CONFIG, producerProps.getLingerMs());                  // small linger to batch
-        cfg.put(ProducerConfig.BUFFER_MEMORY_CONFIG, producerProps.getBufferMemoryBytes());     // 64 MiB
+        cfg.put(ProducerConfig.ACKS_CONFIG, producerProps.getAcks());
+        cfg.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, producerProps.isIdempotence());
+        cfg.put(ProducerConfig.RETRIES_CONFIG, producerProps.getRetries());
+        cfg.put(ProducerConfig.RETRY_BACKOFF_MS_CONFIG, producerProps.getRetryBackoffMs());
+        cfg.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, producerProps.getMaxInFlightRequestsPerConnection());
+        cfg.put(ProducerConfig.COMPRESSION_TYPE_CONFIG, producerProps.getCompressionType());
+        cfg.put(ProducerConfig.BATCH_SIZE_CONFIG, producerProps.getBatchSizeBytes());
+        cfg.put(ProducerConfig.LINGER_MS_CONFIG, producerProps.getLingerMs());
+        cfg.put(ProducerConfig.BUFFER_MEMORY_CONFIG, producerProps.getBufferMemoryBytes());
         cfg.put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, producerProps.getRequestTimeoutMs());
         cfg.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, producerProps.getDeliveryTimeoutMs());
-
         cfg.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
         cfg.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
         return new DefaultKafkaProducerFactory<>(cfg);
@@ -534,15 +549,13 @@ class KafkaConfig {
 
     @Bean
     KafkaTemplate<String, String> kafkaTemplate(ProducerFactory<String, String> pf) {
-        KafkaTemplate<String, String> template = new KafkaTemplate<>(pf);
-        // Optional: observe per-batch success/failure with interceptors if needed
-        return template;
+        return new KafkaTemplate<>(pf);
     }
 
     // ---------- Executor & Metrics ----------
     @Bean(destroyMethod = "shutdown")
     ExecutorService kafkaBatchExecutor() {
-        // Best default: virtual-thread per task (I/O bound, many small async sends)
+        // Virtual thread per task — cheap, ideal for I/O-bound waits
         return Executors.newVirtualThreadPerTaskExecutor();
     }
 
@@ -554,23 +567,111 @@ class KafkaConfig {
 }
 
 /* =====================================================================
-   DOMAIN SERVICE — does the PRODUCE for each record (async Kafka send)
+   PRODUCE OUTCOME — success metadata or failure details
    ===================================================================== */
-interface PaymentService {
-    /**
-     * Process one consumed record:
-     * - Transform/copy headers (optional)
-     * - Produce to the target topic asynchronously
-     * - Return a future that completes when ALL sends for this record complete
-     *   (here it's one send, but design supports 1..N).
-     */
-    CompletableFuture<Void> processPayment(ConsumerRecord<String, String> record);
+final class ProduceOutcome {
+    private final boolean success;
+    private final String topic;
+    private final Integer partition;
+    private final Long offset;
+    private final Long timestamp;
+    private final String exceptionType;
+    private final String errorMessage;
+    private final String exceptionStack;
+    private final boolean retriable;
+
+    private ProduceOutcome(boolean success,
+                           String topic,
+                           Integer partition,
+                           Long offset,
+                           Long timestamp,
+                           String exceptionType,
+                           String errorMessage,
+                           String exceptionStack,
+                           boolean retriable) {
+        this.success = success;
+        this.topic = topic;
+        this.partition = partition;
+        this.offset = offset;
+        this.timestamp = timestamp;
+        this.exceptionType = exceptionType;
+        this.errorMessage = errorMessage;
+        this.exceptionStack = exceptionStack;
+        this.retriable = retriable;
+    }
+
+    static ProduceOutcome success(String topic, int partition, long offset, long timestamp) {
+        return new ProduceOutcome(true, topic, partition, offset, timestamp, null, null, null, false);
+    }
+
+    static ProduceOutcome success(RecordMetadata md) {
+        return success(md.topic(), md.partition(), md.offset(), md.timestamp());
+    }
+
+    static ProduceOutcome failure(String topic, Throwable t, boolean maybeTransient) {
+        Throwable root = (t == null) ? null : rootCause(t);
+        boolean retriable = isKafkaRetriable(root) || maybeTransient;
+        return new ProduceOutcome(false, topic, null, null, null,
+                root == null ? null : root.getClass().getSimpleName(),
+                safeMessage(root),
+                stackTraceOf(root),
+                retriable);
+    }
+
+    static boolean isKafkaRetriable(Throwable t) {
+        while (t != null) {
+            if (t instanceof RetriableException) return true;
+            t = t.getCause();
+        }
+        return false;
+    }
+
+    static Throwable rootCause(Throwable t) {
+        Throwable cur = t;
+        while (cur != null && cur.getCause() != null && cur.getCause() != cur) cur = cur.getCause();
+        return cur;
+    }
+
+    static String safeMessage(Throwable t) {
+        if (t == null) return null;
+        String m = t.getMessage();
+        if (m == null) return t.getClass().getName();
+        return m.length() <= 2000 ? m : m.substring(0, 2000) + "...";
+    }
+
+    static String stackTraceOf(Throwable t) {
+        if (t == null) return null;
+        StringWriter sw = new StringWriter(8192);
+        t.printStackTrace(new PrintWriter(sw));
+        String s = sw.toString();
+        return s.length() <= 16000 ? s : s.substring(0, 16000) + "...";
+    }
+
+    // getters
+    public boolean isSuccess() { return success; }
+    public String getTopic() { return topic; }
+    public Integer getPartition() { return partition; }
+    public Long getOffset() { return offset; }
+    public Long getTimestamp() { return timestamp; }
+    public String getExceptionType() { return exceptionType; }
+    public String getErrorMessage() { return errorMessage; }
+    public String getExceptionStack() { return exceptionStack; }
+    public boolean isRetriable() { return retriable; }
+
+    @Override public String toString() {
+        return success
+                ? ("ProduceOutcome{success, topic=" + topic + ", partition=" + partition + ", offset=" + offset + ", ts=" + timestamp + "}")
+                : ("ProduceOutcome{failure, topic=" + topic + ", error=" + exceptionType + ": " + errorMessage + ", retriable=" + retriable + "}");
+    }
 }
 
-/**
- * Default implementation: one async send per consumed record, copying headers (optional).
- * We return a CompletableFuture&lt;Void&gt; that fails if the send fails.
- */
+/* =====================================================================
+   DOMAIN SERVICE — PRODUCE per record (async) returning ProduceOutcome
+   ===================================================================== */
+interface PaymentService {
+    CompletableFuture<ProduceOutcome> processPayment(ConsumerRecord<String, String> record);
+}
+
 @Service
 @ConditionalOnBean(KafkaTemplate.class)
 class KafkaProducingPaymentService implements PaymentService {
@@ -590,69 +691,81 @@ class KafkaProducingPaymentService implements PaymentService {
     }
 
     @Override
-    public CompletableFuture<Void> processPayment(ConsumerRecord<String, String> record) {
-        // Build ProducerRecord so we can copy headers and set key/value explicitly
+    public CompletableFuture<ProduceOutcome> processPayment(ConsumerRecord<String, String> record) {
         ProducerRecord<String, String> out = new ProducerRecord<>(props.getTargetTopic(), record.key(), record.value());
-        // Recommended: carry traceability (source topic/partition/offset)
+        // Trace headers for source lineage
         out.headers().add("src-topic", record.topic().getBytes(StandardCharsets.UTF_8));
         out.headers().add("src-partition", Integer.toString(record.partition()).getBytes(StandardCharsets.UTF_8));
         out.headers().add("src-offset", Long.toString(record.offset()).getBytes(StandardCharsets.UTF_8));
         if (props.isCopyHeaders() && record.headers() != null) {
-            // Copy existing headers (avoid overwriting the src-* we just set)
             for (Header h : record.headers()) {
-                if (!h.key().startsWith("src-")) {
-                    out.headers().add(h);
-                }
+                if (!h.key().startsWith("src-")) out.headers().add(h);
             }
         }
 
-        // Send asynchronously and wrap with timing + result tags
         Timer.Sample sample = Timer.start(metrics);
-        CompletableFuture<SendResult<String, String>> send = template.send(out);
 
-        return send.handle((res, err) -> {
-            String result = (err == null) ? "success" : "failed";
+        ListenableFuture<SendResult<String, String>> lf = template.send(out);
+        CompletableFuture<SendResult<String, String>> cf = new CompletableFuture<>();
+        lf.addCallback(cf::complete, cf::completeExceptionally);
+
+        return cf.handle((res, err) -> {
+            String tag = (err == null) ? "success" : "failed";
             sample.stop(Timer.builder("kafka.producer.send.latency")
                     .tag("topic", props.getTargetTopic())
-                    .tag("result", result)
+                    .tag("result", tag)
                     .register(metrics));
-            metrics.counter("kafka.producer.send.count", "topic", props.getTargetTopic(), "result", result).increment();
+            metrics.counter("kafka.producer.send.count", "topic", props.getTargetTopic(), "result", tag).increment();
 
             if (err != null) {
-                // Propagate the error so the consumer can decide commit policy
-                throw (err instanceof CompletionException) ? (CompletionException) err : new CompletionException(err);
+                return ProduceOutcome.failure(props.getTargetTopic(),
+                        (err instanceof CompletionException && err.getCause() != null) ? err.getCause() : err, false);
             }
-            return null; // map to Void
+            return ProduceOutcome.success(res.getRecordMetadata());
         }).toCompletableFuture();
     }
 }
 
 /* =====================================================================
-   FALLBACK PaymentService (only if no KafkaTemplate bean exists)
+   FALLBACK PaymentService (no KafkaTemplate)
    ===================================================================== */
 @Service
 @ConditionalOnMissingBean(PaymentService.class)
 class DummyPaymentService implements PaymentService {
     private static final Logger log = LoggerFactory.getLogger(DummyPaymentService.class);
-    @Override public CompletableFuture<Void> processPayment(ConsumerRecord<String, String> record) {
+    @Override public CompletableFuture<ProduceOutcome> processPayment(ConsumerRecord<String, String> record) {
         log.info("Dummy process (no KafkaTemplate): key={}, value={}", record.key(), record.value());
-        return CompletableFuture.completedFuture(null);
+        return CompletableFuture.completedFuture(
+                ProduceOutcome.success("dummy", 0, 0L, System.currentTimeMillis())
+        );
     }
 }
 
 /* =====================================================================
    ERROR STORE — JDBC (PostgreSQL), TRANSACTIONAL + IDEMPOTENT
+   Stores exception stack trace (truncated) for diagnostics.
+   ---------------------------------------------------------------------
+   DDL:
+   CREATE TABLE IF NOT EXISTS payment_error_log (
+       id               BIGSERIAL PRIMARY KEY,
+       topic            TEXT        NOT NULL,
+       partition_no     INT         NOT NULL,
+       record_offset    BIGINT      NOT NULL,
+       msg_key          TEXT        NULL,
+       msg_value        TEXT        NULL,
+       exception_type   TEXT        NULL,
+       error_message    TEXT        NULL,
+       exception_stack  TEXT        NULL,
+       source           VARCHAR(16) NOT NULL,
+       occurred_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       UNIQUE (topic, partition_no, record_offset)
+   );
    ===================================================================== */
 interface ErrorLogBatchService {
     void insertSingle(ErrorRecord record);
     void insertBatch(List<ErrorRecord> records);
 }
 
-/**
- * PostgreSQL implementation using INSERT ... ON CONFLICT DO NOTHING
- * - Single & batch operations are transactional
- * - Duplicate errors for the same (topic, partition, offset) are ignored (idempotency)
- */
 @Repository
 @ConditionalOnBean(JdbcTemplate.class)
 class JdbcErrorLogBatchService implements ErrorLogBatchService {
@@ -662,8 +775,8 @@ class JdbcErrorLogBatchService implements ErrorLogBatchService {
     private static final String INSERT_SQL = """
         INSERT INTO payment_error_log
             (topic, partition_no, record_offset, msg_key, msg_value,
-             error_message, exception_type, source, occurred_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             exception_type, error_message, exception_stack, source, occurred_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (topic, partition_no, record_offset) DO NOTHING
         """;
 
@@ -686,8 +799,8 @@ class JdbcErrorLogBatchService implements ErrorLogBatchService {
             int updated = jdbc.update(INSERT_SQL,
                     r.getTopic(), r.getPartition(), r.getOffset(),
                     r.getKey(), r.getValuePreview(),
-                    r.getErrorMessage(), r.getExceptionType(), r.getSource(),
-                    Timestamp.from(r.getOccurredAt()));
+                    r.getExceptionType(), r.getErrorMessage(), r.getExceptionStack(),
+                    r.getSource(), Timestamp.from(r.getOccurredAt()));
             if (updated == 0) {
                 result = "duplicate";
                 log.debug("Duplicate error row ignored: {}:{}:{}", r.getTopic(), r.getPartition(), r.getOffset());
@@ -726,8 +839,9 @@ class JdbcErrorLogBatchService implements ErrorLogBatchService {
                         ps.setLong(idx++, r.getOffset());
                         ps.setString(idx++, r.getKey());
                         ps.setString(idx++, r.getValuePreview());
-                        ps.setString(idx++, r.getErrorMessage());
                         ps.setString(idx++, r.getExceptionType());
+                        ps.setString(idx++, r.getErrorMessage());
+                        ps.setString(idx++, r.getExceptionStack());
                         ps.setString(idx++, r.getSource());
                         ps.setTimestamp(idx++, Timestamp.from(r.getOccurredAt()));
                     }
@@ -745,35 +859,52 @@ class JdbcErrorLogBatchService implements ErrorLogBatchService {
 }
 
 /* =====================================================================
-   ERROR RECORD — immutable, full traceability (topic/partition/offset)
+   ERROR RECORD — immutable, full traceability + stack traces
    ===================================================================== */
 final class ErrorRecord {
     private final String topic;
     private final int partition;
     private final long offset;
     private final String key;
-    private final String valuePreview;   // truncated to prevent bloating
-    private final String errorMessage;   // truncated
+    private final String valuePreview;   // truncated
     private final String exceptionType;
-    private final String source;         // "SINGLE" | "BATCH" | "TIMEOUT"
+    private final String errorMessage;
+    private final String exceptionStack;
+    private final String source;         // SINGLE | BATCH | TIMEOUT
     private final Instant occurredAt;
 
-    private ErrorRecord(ConsumerRecord<String, String> rec, Throwable ex, String source) {
-        this.topic = rec.topic();
-        this.partition = rec.partition();
-        this.offset = rec.offset();
-        this.key = rec.key();
-        this.valuePreview = truncate(rec.value(), 2000);
-        this.errorMessage = truncate(ex == null ? null : ex.getMessage(), 2000);
-        this.exceptionType = ex == null ? null : ex.getClass().getSimpleName();
+    private ErrorRecord(String topic, int partition, long offset,
+                        String key, String valuePreview,
+                        String exceptionType, String errorMessage, String exceptionStack,
+                        String source, Instant occurredAt) {
+        this.topic = topic;
+        this.partition = partition;
+        this.offset = offset;
+        this.key = key;
+        this.valuePreview = valuePreview;
+        this.exceptionType = exceptionType;
+        this.errorMessage = errorMessage;
+        this.exceptionStack = exceptionStack;
         this.source = source;
-        this.occurredAt = Instant.now();
+        this.occurredAt = occurredAt;
     }
 
-    static ErrorRecord single(ConsumerRecord<String, String> rec, Throwable ex) { return new ErrorRecord(rec, ex, "SINGLE"); }
-    static ErrorRecord batch(ConsumerRecord<String, String> rec, Throwable ex)  { return new ErrorRecord(rec, ex, "BATCH"); }
-    static ErrorRecord timeout(ConsumerRecord<String, String> rec, long timeoutMs) {
-        return new ErrorRecord(rec, new TimeoutException("Processing timed out after " + timeoutMs + " ms"), "TIMEOUT");
+    static ErrorRecord fromOutcome(ConsumerRecord<String, String> src, ProduceOutcome out, String source) {
+        return new ErrorRecord(
+                src.topic(), src.partition(), src.offset(),
+                src.key(), truncate(src.value(), 2000),
+                out.getExceptionType(), out.getErrorMessage(), out.getExceptionStack(),
+                source, Instant.now()
+        );
+    }
+
+    static ErrorRecord timeout(ConsumerRecord<String, String> src, long timeoutMs) {
+        return new ErrorRecord(
+                src.topic(), src.partition(), src.offset(),
+                src.key(), truncate(src.value(), 2000),
+                "TimeoutException", "Processing timed out after " + timeoutMs + " ms", null,
+                "TIMEOUT", Instant.now()
+        );
     }
 
     private static String truncate(String s, int max) {
@@ -781,14 +912,15 @@ final class ErrorRecord {
         return s.length() <= max ? s : s.substring(0, max) + "...";
     }
 
-    // getters (used by JDBC binder)
+    // getters
     public String getTopic() { return topic; }
     public int getPartition() { return partition; }
     public long getOffset() { return offset; }
     public String getKey() { return key; }
     public String getValuePreview() { return valuePreview; }
-    public String getErrorMessage() { return errorMessage; }
     public String getExceptionType() { return exceptionType; }
+    public String getErrorMessage() { return errorMessage; }
+    public String getExceptionStack() { return exceptionStack; }
     public String getSource() { return source; }
     public Instant getOccurredAt() { return occurredAt; }
 
@@ -797,7 +929,6 @@ final class ErrorRecord {
                 "topic='" + topic + '\'' +
                 ", partition=" + partition +
                 ", offset=" + offset +
-                ", key='" + key + '\'' +
                 ", exceptionType='" + exceptionType + '\'' +
                 ", source='" + source + '\'' +
                 ", occurredAt=" + occurredAt +
