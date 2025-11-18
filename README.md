@@ -1,663 +1,250 @@
-# WireMock Integration Tests - Apache HttpClient5 Connection Pooling
-
-Production-grade integration test suite for Spring Boot 3.5 (Java 21) REST client with Apache HttpClient5 connection pooling. This project demonstrates comprehensive testing of all major connection-related exceptions using WireMock.
-
-## Table of Contents
-
-- [Overview](#overview)
-- [Features](#features)
-- [Architecture](#architecture)
-- [Prerequisites](#prerequisites)
-- [Quick Start](#quick-start)
-- [Configuration](#configuration)
-- [Test Coverage](#test-coverage)
-- [Running Tests](#running-tests)
-- [Key Components](#key-components)
-- [Exception Handling](#exception-handling)
-- [Best Practices](#best-practices)
-- [Metrics and Monitoring](#metrics-and-monitoring)
-- [Troubleshooting](#troubleshooting)
-
-## Overview
-
-This project provides a complete reference implementation for testing REST client resilience and connection management in Spring Boot applications. It covers all major connection failure scenarios that can occur in production environments.
-
-## Features
-
-### Production-Grade Configuration
-- ✅ Apache HttpClient5 with advanced connection pooling
-- ✅ Configurable connection limits (max total, max per route)
-- ✅ Stale connection checking and validation
-- ✅ Automatic idle connection eviction
-- ✅ Keep-alive strategy with server negotiation
-- ✅ Retry mechanism with exponential backoff
-- ✅ Comprehensive timeout configuration (connect, socket, connection request)
-
-### Comprehensive Test Coverage
-- ✅ **Stale Connection Tests** - NoHttpResponseException handling
-- ✅ **Connection Timeout Tests** - ConnectTimeoutException scenarios
-- ✅ **Socket Timeout Tests** - SocketTimeoutException (read timeout)
-- ✅ **SSL Error Tests** - SSLHandshakeException, SSLPeerUnverifiedException
-- ✅ **Connection Reset Tests** - EOFException, ConnectionResetException
-- ✅ **Server Error Tests** - 500, 502, 503, 504 status codes
-
-### Observability
-- ✅ Micrometer metrics integration
-- ✅ Prometheus endpoint for monitoring
-- ✅ Structured logging with request/response tracking
-- ✅ Connection pool metrics
-- ✅ Retry attempt tracking
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     RestClient Layer                        │
-│  (Spring Boot 3.5 RestClient with interceptors)             │
-└───────────────────────┬─────────────────────────────────────┘
-                        │
-┌───────────────────────▼─────────────────────────────────────┐
-│            HttpClient Configuration Layer                    │
-│  • Connection Pool Manager (200 total, 50 per route)        │
-│  • Retry Strategy (3 attempts, 1s interval)                 │
-│  • Keep-Alive Strategy (30s default)                        │
-│  • Timeout Configuration (connect, socket, request)         │
-└───────────────────────┬─────────────────────────────────────┘
-                        │
-┌───────────────────────▼─────────────────────────────────────┐
-│              Apache HttpClient5 Layer                        │
-│  • Connection pooling and lifecycle management               │
-│  • Stale connection checking                                │
-│  • Idle connection eviction                                 │
-│  • Connection validation                                    │
-└───────────────────────┬─────────────────────────────────────┘
-                        │
-┌───────────────────────▼─────────────────────────────────────┐
-│                   WireMock Server                            │
-│  • Simulates various failure scenarios                       │
-│  • HTTP/HTTPS endpoints                                     │
-│  • Fault injection (faults, delays, errors)                 │
-└─────────────────────────────────────────────────────────────┘
-```
-
-## Prerequisites
-
-- **Java 21** or higher
-- **Maven 3.8+** or Gradle 8+
-- **Spring Boot 3.5.0-M1** (or latest 3.5.x)
-
-## Quick Start
-
-### 1. Clone and Build
-
-```bash
-cd wiremock-integration-tests
-mvn clean install
-```
-
-### 2. Run All Tests
-
-```bash
-mvn test
-```
-
-### 3. Run Specific Test Class
-
-```bash
-mvn test -Dtest=StaleConnectionTest
-mvn test -Dtest=ConnectionTimeoutTest
-mvn test -Dtest=SocketTimeoutTest
-mvn test -Dtest=SslErrorTest
-mvn test -Dtest=ConnectionResetTest
-mvn test -Dtest=ServerErrorTest
-```
-
-### 4. Run Application
-
-```bash
-mvn spring-boot:run
-```
-
-Access metrics at: `http://localhost:8080/actuator/prometheus`
-
-## Configuration
-
-### Connection Pool Configuration
-
-```yaml
-http:
-  client:
-    connection:
-      pool:
-        max-total: 200                    # Maximum total connections
-        max-per-route: 50                 # Maximum connections per route
-        validate-after-inactivity-ms: 2000 # Validate after 2s inactivity
-        evict-idle-connections-after-ms: 60000 # Evict after 60s idle
-```
-
-### Timeout Configuration
-
-```yaml
-http:
-  client:
-    connection:
-      timeout:
-        connect-ms: 3000                  # Connection timeout: 3s
-        socket-ms: 5000                   # Socket/read timeout: 5s
-        connection-request-ms: 1000       # Pool checkout timeout: 1s
-```
-
-### Retry Configuration
-
-```yaml
-http:
-  client:
-    connection:
-      retry:
-        enabled: true                     # Enable retry handler
-        count: 3                          # Number of retry attempts
-        interval-ms: 1000                 # Interval between retries
-```
-
-### Keep-Alive Configuration
-
-```yaml
-http:
-  client:
-    connection:
-      keep-alive:
-        enabled: true                     # Enable keep-alive
-        duration-ms: 30000                # Keep-alive duration: 30s
-      stale-connection-check: true        # Enable stale connection checking
-```
+package com.yourorg.kafka.config;
 
-## Test Coverage
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.context.annotation.Configuration;
 
-### 1. Stale Connection Tests (`StaleConnectionTest.java`)
+import java.util.HashMap;
+import java.util.Map;
 
-Simulates scenarios where connections in the pool become stale:
+@Configuration
+@ConfigurationProperties(prefix = "kafka.consumer")
+public class KafkaConsumerProperties {
 
-| Test Case | Scenario | Expected Outcome |
-|-----------|----------|------------------|
-| `testStaleConnectionWithEmptyResponse` | Connection returns empty response | `NoHttpResponseException` wrapped in `ResourceAccessException` |
-| `testStaleConnectionRetrySuccess` | First request fails, retry succeeds | Request succeeds on retry |
-| `testMultipleStaleConnectionsInSequence` | Sequential stale connections | Each handled appropriately |
-| `testStaleConnectionAfterKeepAliveTimeout` | Keep-alive expires | Stale connection detected |
-| `testConnectionValidationAfterInactivity` | Connection idle validation | Connection validated before reuse |
-| `testExhaustedRetriesOnStaleConnection` | Persistent stale connections | All retries exhausted |
+    // 🔹 Core Kafka configs
+    private String bootstrapServers = "localhost:9092";
+    private String groupId = "default-group";
+    private String topic = "payments-topic";
+    private boolean enableAutoCommit = false;
+    private String autoOffsetReset = "latest";
+    private int maxPollRecords = 1000;
+    private int concurrency = 3;
 
-**WireMock Fault:** `Fault.EMPTY_RESPONSE`
+    // 🔹 Batch toggle
+    private boolean batchEnabled = true; // ✅ default = true
 
-### 2. Connection Timeout Tests (`ConnectionTimeoutTest.java`)
+    // 🔹 Consumer timeout & heartbeat tuning
+    private int sessionTimeoutMs = 45000;        // Default 45s
+    private int heartbeatIntervalMs = 15000;     // Default 15s
+    private int maxPollIntervalMs = 300000;      // Default 5 min
 
-Tests connection establishment timeouts:
+    // 🔹 Fetch tuning
+    private int fetchMinBytes = 1048576;         // 1 MB
+    private int fetchMaxBytes = 52428800;        // 50 MB
+    private int fetchMaxWaitMs = 500;            // Wait up to 500ms for more data
 
-| Test Case | Scenario | Expected Outcome |
-|-----------|----------|------------------|
-| `testConnectionTimeoutUnreachableServer` | Unreachable host | `ConnectTimeoutException` |
-| `testConnectionTimeoutStoppedServer` | Stopped server | Connection refused/timeout |
-| `testConnectionTimeoutRetrySuccess` | Retry on timeout | Retry mechanism verified |
-| `testConnectionPoolExhaustion` | Pool exhaustion | Graceful handling |
-| `testConnectionTimeoutRespected` | Timeout configuration | Timeout duration respected |
+    // 🔹 Offset & commit control
+    private boolean isolationReadCommitted = true;  // For transactional producers
+    private boolean autoCommitSync = false;         // Manual offset commit style
+    private int autoCommitIntervalMs = 5000;        // If auto commit enabled
 
-**Test Approach:** Uses unreachable IPs (192.0.2.1) and stopped servers
+    // 🔹 Network tuning
+    private int requestTimeoutMs = 30000;
+    private int retryBackoffMs = 100;
+    private int reconnectBackoffMs = 1000;
 
-### 3. Socket Timeout Tests (`SocketTimeoutTest.java`)
+    // 🔹 Cluster/Instance identification (for OCP multi-cluster)
+    private String clientId = "default-client";
+    private String groupInstanceId = ""; // Used for static membership
 
-Tests read/socket timeout scenarios:
+    // 🔹 Dynamic extra configs (optional)
+    private Map<String, Object> extra = new HashMap<>();
 
-| Test Case | Scenario | Expected Outcome |
-|-----------|----------|------------------|
-| `testSocketTimeoutOnSlowResponse` | Server delays beyond timeout | `SocketTimeoutException` |
-| `testSuccessWithinSocketTimeout` | Response within timeout | Success |
-| `testSocketTimeoutRetrySuccess` | Retry after timeout | Succeeds on retry |
-| `testSocketTimeoutOnSlowDataTransfer` | Slow chunked transfer | Timeout on slow read |
-| `testExhaustedRetriesOnSocketTimeout` | Persistent timeouts | All retries exhausted |
-| `testVaryingResponseDelays` | Different delay scenarios | Correct timeout behavior |
+    // --- Getters and Setters ---
 
-**WireMock Configuration:** `withFixedDelay()`, `withChunkedDribbleDelay()`
+    public String getBootstrapServers() { return bootstrapServers; }
+    public void setBootstrapServers(String bootstrapServers) { this.bootstrapServers = bootstrapServers; }
 
-### 4. SSL Error Tests (`SslErrorTest.java`)
+    public String getGroupId() { return groupId; }
+    public void setGroupId(String groupId) { this.groupId = groupId; }
 
-Tests SSL/TLS failure scenarios:
+    public String getTopic() { return topic; }
+    public void setTopic(String topic) { this.topic = topic; }
 
-| Test Case | Scenario | Expected Outcome |
-|-----------|----------|------------------|
-| `testSslHandshakeFailureWithSelfSignedCert` | Self-signed certificate | `SSLHandshakeException` |
-| `testSslErrorOnPostRequest` | SSL error on POST | SSL exception |
-| `testHttpVsHttpsEndpoints` | Protocol differentiation | HTTP succeeds, HTTPS fails |
-| `testSslErrorsNotRetried` | SSL retry behavior | No retries on SSL errors |
-| `testSslErrorLogging` | Error logging | Detailed error information |
+    public boolean isEnableAutoCommit() { return enableAutoCommit; }
+    public void setEnableAutoCommit(boolean enableAutoCommit) { this.enableAutoCommit = enableAutoCommit; }
 
-**WireMock Configuration:** HTTPS endpoints with self-signed certificates
+    public String getAutoOffsetReset() { return autoOffsetReset; }
+    public void setAutoOffsetReset(String autoOffsetReset) { this.autoOffsetReset = autoOffsetReset; }
 
-### 5. Connection Reset Tests (`ConnectionResetTest.java`)
+    public int getMaxPollRecords() { return maxPollRecords; }
+    public void setMaxPollRecords(int maxPollRecords) { this.maxPollRecords = maxPollRecords; }
 
-Tests connection reset scenarios:
+    public int getConcurrency() { return concurrency; }
+    public void setConcurrency(int concurrency) { this.concurrency = concurrency; }
 
-| Test Case | Scenario | Expected Outcome |
-|-----------|----------|------------------|
-| `testConnectionResetByPeer` | TCP RST packet | `SocketException`/`EOFException` |
-| `testConnectionResetRetrySuccess` | Retry after reset | Succeeds on retry |
-| `testRandomDataThenClose` | Random data then close | Connection error |
-| `testMalformedResponseChunk` | Malformed HTTP response | Parsing/connection error |
-| `testRecoveryFromTransientResets` | Transient resets | Recovery after retries |
+    public boolean isBatchEnabled() { return batchEnabled; }
+    public void setBatchEnabled(boolean batchEnabled) { this.batchEnabled = batchEnabled; }
 
-**WireMock Faults:** `Fault.CONNECTION_RESET_BY_PEER`, `Fault.RANDOM_DATA_THEN_CLOSE`, `Fault.MALFORMED_RESPONSE_CHUNK`
+    public int getSessionTimeoutMs() { return sessionTimeoutMs; }
+    public void setSessionTimeoutMs(int sessionTimeoutMs) { this.sessionTimeoutMs = sessionTimeoutMs; }
 
-### 6. Server Error Tests (`ServerErrorTest.java`)
+    public int getHeartbeatIntervalMs() { return heartbeatIntervalMs; }
+    public void setHeartbeatIntervalMs(int heartbeatIntervalMs) { this.heartbeatIntervalMs = heartbeatIntervalMs; }
 
-Tests HTTP 5xx status code handling:
+    public int getMaxPollIntervalMs() { return maxPollIntervalMs; }
+    public void setMaxPollIntervalMs(int maxPollIntervalMs) { this.maxPollIntervalMs = maxPollIntervalMs; }
 
-| Test Case | Scenario | Expected Outcome |
-|-----------|----------|------------------|
-| `testInternalServerError` | 500 status | `HttpServerErrorException` with 500 |
-| `testBadGateway` | 502 status | `HttpServerErrorException` with 502 |
-| `testServiceUnavailable` | 503 status | `HttpServerErrorException` with 503 |
-| `testGatewayTimeout` | 504 status | `HttpServerErrorException` with 504 |
-| `testServerErrorRetrySuccess` | Retry after 500 | Succeeds on retry |
-| `testErrorResponseParsing` | Detailed error response | Error details parsed |
-| `testDifferentServerErrorCodes` | All 5xx codes | Correct status code detection |
+    public int getFetchMinBytes() { return fetchMinBytes; }
+    public void setFetchMinBytes(int fetchMinBytes) { this.fetchMinBytes = fetchMinBytes; }
 
-**WireMock Configuration:** `withStatus(5xx)`
+    public int getFetchMaxBytes() { return fetchMaxBytes; }
+    public void setFetchMaxBytes(int fetchMaxBytes) { this.fetchMaxBytes = fetchMaxBytes; }
 
-## Running Tests
+    public int getFetchMaxWaitMs() { return fetchMaxWaitMs; }
+    public void setFetchMaxWaitMs(int fetchMaxWaitMs) { this.fetchMaxWaitMs = fetchMaxWaitMs; }
 
-### Run All Tests
+    public boolean isIsolationReadCommitted() { return isolationReadCommitted; }
+    public void setIsolationReadCommitted(boolean isolationReadCommitted) { this.isolationReadCommitted = isolationReadCommitted; }
 
-```bash
-mvn test
-```
+    public boolean isAutoCommitSync() { return autoCommitSync; }
+    public void setAutoCommitSync(boolean autoCommitSync) { this.autoCommitSync = autoCommitSync; }
 
-### Run with Coverage
+    public int getAutoCommitIntervalMs() { return autoCommitIntervalMs; }
+    public void setAutoCommitIntervalMs(int autoCommitIntervalMs) { this.autoCommitIntervalMs = autoCommitIntervalMs; }
 
-```bash
-mvn test jacoco:report
-```
+    public int getRequestTimeoutMs() { return requestTimeoutMs; }
+    public void setRequestTimeoutMs(int requestTimeoutMs) { this.requestTimeoutMs = requestTimeoutMs; }
 
-Coverage report: `target/site/jacoco/index.html`
+    public int getRetryBackoffMs() { return retryBackoffMs; }
+    public void setRetryBackoffMs(int retryBackoffMs) { this.retryBackoffMs = retryBackoffMs; }
 
-### Run Specific Test Category
+    public int getReconnectBackoffMs() { return reconnectBackoffMs; }
+    public void setReconnectBackoffMs(int reconnectBackoffMs) { this.reconnectBackoffMs = reconnectBackoffMs; }
 
-```bash
-# Stale connection tests
-mvn test -Dtest=StaleConnectionTest
+    public String getClientId() { return clientId; }
+    public void setClientId(String clientId) { this.clientId = clientId; }
 
-# Timeout tests
-mvn test -Dtest=ConnectionTimeoutTest,SocketTimeoutTest
+    public String getGroupInstanceId() { return groupInstanceId; }
+    public void setGroupInstanceId(String groupInstanceId) { this.groupInstanceId = groupInstanceId; }
 
-# Error tests
-mvn test -Dtest=ServerErrorTest,SslErrorTest
-```
-
-### Run with Specific Log Level
-
-```bash
-mvn test -Dlogging.level.org.apache.hc.client5=DEBUG
-```
-
-### Run with Custom Configuration
-
-```bash
-mvn test -Dspring.profiles.active=test -Dhttp.client.connection.timeout.connect-ms=5000
-```
-
-## Key Components
-
-### 1. HttpClientConfiguration
-
-**Location:** `src/main/java/com/orchestrator/wiremock/config/HttpClientConfiguration.java`
-
-Provides production-grade Apache HttpClient5 configuration:
-
-```java
-@Bean
-public PoolingHttpClientConnectionManager poolingConnectionManager() {
-    ConnectionConfig connectionConfig = ConnectionConfig.custom()
-        .setConnectTimeout(Timeout.ofMilliseconds(connectMs))
-        .setSocketTimeout(Timeout.ofMilliseconds(socketMs))
-        .setValidateAfterInactivity(TimeValue.ofMilliseconds(validateMs))
-        .build();
-
-    return PoolingHttpClientConnectionManagerBuilder.create()
-        .setMaxConnTotal(maxTotal)
-        .setMaxConnPerRoute(maxPerRoute)
-        .setDefaultConnectionConfig(connectionConfig)
-        .build();
+    public Map<String, Object> getExtra() { return extra; }
+    public void setExtra(Map<String, Object> extra) { this.extra = extra; }
 }
-```
+kafka:
+  consumer:
+    bootstrap-servers: prod-broker1:9092,prod-broker2:9092
+    group-id: payments-consumer
+    topic: payments-topic
+    concurrency: 8
+    batch-enabled: true
+    enable-auto-commit: false
+    auto-offset-reset: earliest
+    session-timeout-ms: 45000
+    heartbeat-interval-ms: 15000
+    max-poll-interval-ms: 300000
+    max-poll-records: 2000
+    fetch-min-bytes: 1048576
+    fetch-max-bytes: 52428800
+    fetch-max-wait-ms: 1000
+    retry-backoff-ms: 100
+    reconnect-backoff-ms: 1000
+    client-id: ${CLUSTER_ID}-${HOSTNAME}
+    group-instance-id: ${CLUSTER_ID}-${HOSTNAME}
+    extra:
+      isolation.level: read_committed
+package com.yourorg.kafka.config;
 
-**Key Features:**
-- Connection pool management
-- Stale connection checking
-- Idle connection eviction
-- Retry strategy
-- Keep-alive strategy
-- Metrics integration
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.common.serialization.StringDeserializer;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
+import org.springframework.kafka.core.ConsumerFactory;
+import org.springframework.kafka.core.DefaultKafkaConsumerFactory;
+import org.springframework.kafka.listener.ContainerProperties;
+import org.springframework.kafka.listener.DefaultErrorHandler;
+import org.springframework.kafka.listener.DeadLetterPublishingRecoverer;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.util.backoff.FixedBackOff;
 
-### 2. RestClientConfiguration
+import java.util.HashMap;
+import java.util.Map;
 
-**Location:** `src/main/java/com/orchestrator/wiremock/config/RestClientConfiguration.java`
+@Configuration
+public class KafkaConsumerConfig {
 
-Configures Spring Boot 3.5 RestClient with request/response interceptors:
+    @Bean
+    public ConsumerFactory<String, String> consumerFactory(KafkaConsumerProperties props) {
+        Map<String, Object> config = new HashMap<>();
 
-```java
-@Bean
-public RestClient restClient() {
-    return RestClient.builder()
-        .requestFactory(requestFactory)
-        .requestInterceptor((request, body, execution) -> {
-            // Request/response logging
-            // Metrics tracking
-            // Error handling
-        })
-        .build();
-}
-```
+        // 🔹 Core Connection
+        config.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, props.getBootstrapServers());
+        config.put(ConsumerConfig.GROUP_ID_CONFIG, props.getGroupId());
+        config.put(ConsumerConfig.CLIENT_ID_CONFIG, props.getClientId());
+        if (props.getGroupInstanceId() != null && !props.getGroupInstanceId().isEmpty()) {
+            config.put(ConsumerConfig.GROUP_INSTANCE_ID_CONFIG, props.getGroupInstanceId());
+        }
 
-### 3. ExternalApiClient
+        // 🔹 Core Consumer Behavior
+        config.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, props.isEnableAutoCommit());
+        config.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, props.getAutoOffsetReset());
+        config.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, props.getMaxPollRecords());
 
-**Location:** `src/main/java/com/orchestrator/wiremock/client/ExternalApiClient.java`
+        // 🔹 Polling & Heartbeat Tuning
+        config.put(ConsumerConfig.MAX_POLL_INTERVAL_MS_CONFIG, props.getMaxPollIntervalMs());
+        config.put(ConsumerConfig.SESSION_TIMEOUT_MS_CONFIG, props.getSessionTimeoutMs());
+        config.put(ConsumerConfig.HEARTBEAT_INTERVAL_MS_CONFIG, props.getHeartbeatIntervalMs());
 
-Sample REST client service demonstrating usage:
+        // 🔹 Fetch & Network Performance
+        config.put(ConsumerConfig.FETCH_MIN_BYTES_CONFIG, props.getFetchMinBytes());
+        config.put(ConsumerConfig.FETCH_MAX_BYTES_CONFIG, props.getFetchMaxBytes());
+        config.put(ConsumerConfig.FETCH_MAX_WAIT_MS_CONFIG, props.getFetchMaxWaitMs());
+        config.put(ConsumerConfig.REQUEST_TIMEOUT_MS_CONFIG, props.getRequestTimeoutMs());
+        config.put(ConsumerConfig.RETRY_BACKOFF_MS_CONFIG, props.getRetryBackoffMs());
+        config.put(ConsumerConfig.RECONNECT_BACKOFF_MS_CONFIG, props.getReconnectBackoffMs());
 
-```java
-@Service
-public class ExternalApiClient {
-    public String get(String url) {
-        return restClient.get()
-            .uri(url)
-            .retrieve()
-            .body(String.class);
+        // 🔹 Isolation Level & Commit Strategy
+        if (props.isIsolationReadCommitted()) {
+            config.put("isolation.level", "read_committed");
+        } else {
+            config.put("isolation.level", "read_uncommitted");
+        }
+
+        if (props.isEnableAutoCommit()) {
+            config.put(ConsumerConfig.AUTO_COMMIT_INTERVAL_MS_CONFIG, props.getAutoCommitIntervalMs());
+        }
+
+        // 🔹 Deserializers
+        config.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        config.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+
+        // 🔹 Merge extra configs (dynamic extensions)
+        config.putAll(props.getExtra());
+
+        return new DefaultKafkaConsumerFactory<>(config);
     }
-}
-```
 
-### 4. BaseWireMockTest
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory<String, String> kafkaListenerContainerFactory(
+            ConsumerFactory<String, String> consumerFactory,
+            KafkaConsumerProperties props,
+            KafkaTemplate<String, String> kafkaTemplate) {
 
-**Location:** `src/test/java/com/orchestrator/wiremock/BaseWireMockTest.java`
+        ConcurrentKafkaListenerContainerFactory<String, String> factory =
+                new ConcurrentKafkaListenerContainerFactory<>();
+        factory.setConsumerFactory(consumerFactory);
 
-Base class for all WireMock tests:
+        // 🔹 Batch vs. Single Message Mode
+        factory.setBatchListener(props.isBatchEnabled());
 
-```java
-@SpringBootTest
-@ActiveProfiles("test")
-public abstract class BaseWireMockTest {
-    protected WireMockServer wireMockServer;
+        // 🔹 Concurrency
+        factory.setConcurrency(props.getConcurrency());
 
-    @BeforeEach
-    void setUp() {
-        wireMockServer = new WireMockServer(
-            WireMockConfiguration.options().dynamicPort()
+        // 🔹 Acknowledgment Strategy
+        factory.getContainerProperties().setAckMode(
+                props.isBatchEnabled()
+                        ? ContainerProperties.AckMode.MANUAL   // commit after batch success
+                        : ContainerProperties.AckMode.MANUAL_IMMEDIATE // commit per record
         );
-        wireMockServer.start();
+
+        // 🔹 Error Handling and DLQ (Optional)
+        DeadLetterPublishingRecoverer recoverer = new DeadLetterPublishingRecoverer(kafkaTemplate);
+        DefaultErrorHandler errorHandler = new DefaultErrorHandler(
+                recoverer,
+                new FixedBackOff(1000L, 3L) // retry every 1s, up to 3 times
+        );
+        factory.setCommonErrorHandler(errorHandler);
+
+        return factory;
     }
 }
-```
-
-## Exception Handling
-
-### Exception Hierarchy
-
-```
-ResourceAccessException (Spring)
-├── NoHttpResponseException (Apache HttpClient5)
-│   └── Stale connection in pool
-├── ConnectTimeoutException (Apache HttpClient5)
-│   └── Connection establishment timeout
-├── SocketTimeoutException (Java)
-│   └── Read/socket timeout
-├── SSLException (Java)
-│   ├── SSLHandshakeException
-│   └── SSLPeerUnverifiedException
-├── SocketException (Java)
-│   ├── ConnectionResetException
-│   └── EOFException
-└── ConnectionClosedException (Apache HttpClient5)
-
-HttpServerErrorException (Spring)
-├── 500 Internal Server Error
-├── 502 Bad Gateway
-├── 503 Service Unavailable
-└── 504 Gateway Timeout
-```
-
-### Exception Handling Best Practices
-
-1. **Catch Specific Exceptions**
-```java
-try {
-    return apiClient.get(url);
-} catch (ResourceAccessException ex) {
-    if (ex.getCause() instanceof ConnectTimeoutException) {
-        // Handle connection timeout
-    } else if (ex.getCause() instanceof SocketTimeoutException) {
-        // Handle read timeout
-    }
-}
-```
-
-2. **Implement Circuit Breaker Pattern**
-```java
-@CircuitBreaker(name = "externalApi", fallbackMethod = "fallback")
-public String callExternalApi(String url) {
-    return apiClient.get(url);
-}
-```
-
-3. **Use Retry with Backoff**
-```java
-@Retry(name = "externalApi",
-       maxAttempts = 3,
-       waitDuration = Duration.ofMillis(1000))
-public String callExternalApi(String url) {
-    return apiClient.get(url);
-}
-```
-
-## Best Practices
-
-### Connection Pool Sizing
-
-**Formula:** `Max Connections = (CPU Cores * 2) + Effective Spindle Count`
-
-**Example Configuration:**
-```yaml
-# For 8-core system with HDD
-max-total: 200      # (8 * 2) + effective spindles
-max-per-route: 50   # 25% of max-total
-```
-
-### Timeout Configuration
-
-| Timeout Type | Recommended Value | Use Case |
-|-------------|-------------------|----------|
-| Connect Timeout | 2-5 seconds | Time to establish TCP connection |
-| Socket Timeout | 5-30 seconds | Time to receive response data |
-| Connection Request | 0.5-2 seconds | Time to get connection from pool |
-
-### Retry Strategy
-
-**Idempotent Methods (Safe to Retry):**
-- GET, HEAD, OPTIONS, TRACE, PUT, DELETE
-
-**Non-Idempotent Methods (Careful with Retry):**
-- POST (may create duplicates)
-
-```java
-// Configure retry for idempotent methods only
-.setRetryStrategy(new DefaultHttpRequestRetryStrategy(3, TimeValue.ofSeconds(1)) {
-    @Override
-    public boolean retryRequest(HttpRequest request, IOException exception, int execCount, HttpContext context) {
-        // Only retry idempotent methods
-        return request.getMethod().equals("GET") && super.retryRequest(request, exception, execCount, context);
-    }
-});
-```
-
-### Keep-Alive Configuration
-
-```yaml
-# Server-side
-Connection: keep-alive
-Keep-Alive: timeout=60, max=100
-
-# Client-side
-keep-alive:
-  enabled: true
-  duration-ms: 30000  # Shorter than server timeout
-```
-
-## Metrics and Monitoring
-
-### Available Metrics
-
-**Connection Pool Metrics:**
-```
-http.client.pool.total.max             # Maximum total connections
-http.client.pool.total.available       # Available connections
-```
-
-**Request Metrics:**
-```
-http.client.requests                   # Request count and duration
-  - method: GET|POST|PUT|DELETE
-  - status: 200|500|...
-  - outcome: SUCCESS|ERROR
-  - exception: ConnectTimeoutException|...
-```
-
-**Error Metrics:**
-```
-http.client.errors                     # Error count by type
-  - exception: ConnectTimeoutException|SocketTimeoutException|...
-```
-
-**Retry Metrics:**
-```
-http.client.retry                      # Retry count by exception
-  - exception: NoHttpResponseException|...
-```
-
-### Prometheus Queries
-
-```promql
-# Request rate
-rate(http_client_requests_total[5m])
-
-# Error rate
-rate(http_client_errors_total[5m])
-
-# Average response time
-rate(http_client_requests_seconds_sum[5m])
-  / rate(http_client_requests_seconds_count[5m])
-
-# Connection pool utilization
-http_client_pool_total_max - http_client_pool_total_available
-```
-
-### Grafana Dashboard
-
-Create dashboard with panels for:
-1. Request throughput (req/s)
-2. Error rate (%)
-3. Response time (p50, p95, p99)
-4. Connection pool utilization
-5. Retry rate
-6. Timeout occurrences
-
-## Troubleshooting
-
-### Common Issues
-
-#### 1. Connection Pool Exhaustion
-
-**Symptom:** `ConnectionRequestTimeoutException`
-
-**Solution:**
-```yaml
-http.client.connection.pool.max-total: 500  # Increase pool size
-http.client.connection.timeout.connection-request-ms: 5000  # Increase timeout
-```
-
-#### 2. Stale Connection Errors
-
-**Symptom:** Frequent `NoHttpResponseException`
-
-**Solution:**
-```yaml
-http.client.connection.pool.validate-after-inactivity-ms: 1000  # More aggressive validation
-http.client.connection.pool.evict-idle-connections-after-ms: 30000  # Faster eviction
-```
-
-#### 3. Timeout Issues
-
-**Symptom:** Requests timing out frequently
-
-**Solution:**
-```yaml
-# Increase timeouts
-http.client.connection.timeout.connect-ms: 10000
-http.client.connection.timeout.socket-ms: 30000
-
-# Or implement circuit breaker
-@CircuitBreaker(name = "api", fallbackMethod = "fallback")
-```
-
-#### 4. SSL Errors
-
-**Symptom:** `SSLHandshakeException`
-
-**Solution:**
-```java
-// Configure trust store
-SSLContext sslContext = SSLContextBuilder.create()
-    .loadTrustMaterial(trustStore, new TrustSelfSignedStrategy())
-    .build();
-
-connectionManager.setSSLContext(sslContext);
-```
-
-### Debug Logging
-
-Enable debug logging for troubleshooting:
-
-```yaml
-logging:
-  level:
-    org.apache.hc.client5: DEBUG
-    org.apache.hc.client5.http.wire: TRACE  # Full request/response
-    com.orchestrator: DEBUG
-```
-
-### Health Checks
-
-Monitor application health:
-
-```bash
-curl http://localhost:8080/actuator/health
-```
-
-## License
-
-MIT License - See LICENSE file for details
-
-## Contributing
-
-Contributions welcome! Please follow the contribution guidelines.
-
-## Support
-
-For issues and questions:
-- GitHub Issues: [Create an issue](https://github.com/your-org/wiremock-integration-tests/issues)
-- Documentation: [Wiki](https://github.com/your-org/wiremock-integration-tests/wiki)
-
----
-
-**Built with:**
-- Spring Boot 3.5
-- Apache HttpClient5
-- WireMock 3.x
-- Java 21
-- JUnit 5
-- AssertJ
