@@ -1,59 +1,17 @@
 /*
 ==========================
-= 1) SQL DDL (MariaDB)   =
+= 1) application.yml     =
 ==========================
 
-Use this to create the table (or adjust your existing one).
+Configure the table name here. You can change it per env.
 
-CREATE TABLE event_details (
-    id                 BIGINT UNSIGNED NOT NULL,
-
-    event_trace_id     VARCHAR(100)    NOT NULL,
-    account_number     VARCHAR(64)     NOT NULL,
-    customer_type      VARCHAR(32)     NOT NULL,
-
-    event_timestamp_ms BIGINT          NOT NULL,
-
-    topic              VARCHAR(200)    NOT NULL,
-    partition_id       INT             NOT NULL,
-    kafka_offset       BIGINT          NOT NULL,
-    message_key        VARCHAR(256)    NULL,
-
-    source_payload      MEDIUMTEXT     NULL,
-    transformed_payload MEDIUMTEXT     NULL,
-
-    exception_type     VARCHAR(255)    NULL,
-    exception_message  TEXT            NULL,
-    exception_stack    MEDIUMTEXT      NULL,
-
-    retriable          TINYINT(1)      NOT NULL DEFAULT 0,
-    retry_attempt      INT             NOT NULL DEFAULT 0,
-
-    status             VARCHAR(20)     NOT NULL DEFAULT 'SUCCESS',
-
-    created_at         DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-    updated_at         DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
-                                          ON UPDATE CURRENT_TIMESTAMP(3),
-
-    PRIMARY KEY (id),
-
-    UNIQUE KEY uk_topic_partition_offset (topic, partition_id, kafka_offset),
-    KEY idx_account_number (account_number),
-    KEY idx_event_trace_id (event_trace_id),
-    KEY idx_partition (partition_id),
-    KEY idx_kafka_offset (kafka_offset)
-) ENGINE = InnoDB
-  DEFAULT CHARSET = utf8mb4
-  COLLATE = utf8mb4_unicode_ci;
-
--- If table already exists, just add status:
--- ALTER TABLE event_details
---   ADD COLUMN status VARCHAR(20) NOT NULL DEFAULT 'SUCCESS' AFTER retry_attempt;
-
+app:
+  event-details-table: event_details
 
 
 ==========================================
-= 2) Spring JDBC repository with enum   =
+= 2) Spring JDBC repository (TSID + enum)
+=    with table name from app.yml
 ==========================================
 */
 
@@ -66,6 +24,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.f4b6a3.tsid.TsidCreator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DataAccessException;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.BatchPreparedStatementSetter;
@@ -82,40 +41,14 @@ public class EventStatusJdbcRepository {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(EventStatusJdbcRepository.class);
 
-    private static final String INSERT_SQL = """
-        INSERT INTO event_details (
-            id,
-            event_trace_id,
-            account_number,
-            customer_type,
-            event_timestamp_ms,
-            topic,
-            partition_id,
-            kafka_offset,
-            message_key,
-            source_payload,
-            transformed_payload,
-            exception_type,
-            exception_message,
-            exception_stack,
-            retriable,
-            retry_attempt,
-            status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """;
+    // We’ll build this from the table name in the constructor
+    private final String insertSql;
 
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
     private final JdbcTemplate jdbcTemplate;
 
-    public EventStatusJdbcRepository(JdbcTemplate jdbcTemplate) {
-        this.jdbcTemplate = jdbcTemplate;
-    }
-
-    // ---------------------------------------------------------------------
-    // Status enum (backed by VARCHAR(20) in DB)
-    // Includes your requested values + SUCCESS/FAILED for terminal state.
-    // ---------------------------------------------------------------------
+    // Status enum (stored as VARCHAR(20) in "status" column)
     public enum EventStatus {
         SUCCESS,
         FAILED,
@@ -123,6 +56,50 @@ public class EventStatusJdbcRepository {
         RETRIED,
         SKIPPED,
         PARTIAL
+    }
+
+    public EventStatusJdbcRepository(
+            JdbcTemplate jdbcTemplate,
+            @Value("${app.event-details-table:event_details}") String tableName
+    ) {
+        this.jdbcTemplate = jdbcTemplate;
+        // Safeguard: no quotes or weird things in tableName
+        this.insertSql = buildInsertSql(sanitizeTableName(tableName));
+        LOGGER.info("EventStatusJdbcRepository using table '{}'", tableName);
+    }
+
+    // Build the INSERT statement using the configured table name
+    private String buildInsertSql(String tableName) {
+        return """
+            INSERT INTO %s (
+                id,
+                event_trace_id,
+                account_number,
+                customer_type,
+                event_timestamp_ms,
+                topic,
+                partition_id,
+                kafka_offset,
+                message_key,
+                source_payload,
+                transformed_payload,
+                exception_type,
+                exception_message,
+                exception_stack,
+                retriable,
+                retry_attempt,
+                status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """.formatted(tableName);
+    }
+
+    // Very simple sanitiser to avoid backticks/injection in table name
+    private String sanitizeTableName(String tableName) {
+        // Allow only letters, digits, underscore
+        if (!tableName.matches("[A-Za-z0-9_]+")) {
+            throw new IllegalArgumentException("Invalid table name: " + tableName);
+        }
+        return tableName;
     }
 
     // ---------------------------------------------------------------------
@@ -135,13 +112,11 @@ public class EventStatusJdbcRepository {
 
     // ---------------------------------------------------------------------
     // Single insert: FAILED record
-    //  - true  => row inserted OR duplicate key (unique constraint) treated as success
-    //  - false => any other DB error
     // ---------------------------------------------------------------------
     public boolean persistFailedRecord(EventDetails event) {
         long id = nextId();
         try {
-            int updated = jdbcTemplate.update(INSERT_SQL, ps -> {
+            int updated = jdbcTemplate.update(insertSql, ps -> {
                 setCommonFields(ps, id, event);
                 ps.setString(12, event.getExceptionType());
                 ps.setString(13, event.getExceptionMessage());
@@ -152,7 +127,6 @@ public class EventStatusJdbcRepository {
             });
             return updated == 1;
         } catch (DuplicateKeyException ex) {
-            // Unique constraint violation => treat as logical success (idempotent)
             LOGGER.info("Duplicate key on persistFailedRecord (treating as success). eventTraceId={}",
                     event.getEventTraceId(), ex);
             return true;
@@ -164,13 +138,11 @@ public class EventStatusJdbcRepository {
 
     // ---------------------------------------------------------------------
     // Single insert: SUCCESS record
-    //  - true  => row inserted OR duplicate key treated as success
-    //  - false => any other DB error
     // ---------------------------------------------------------------------
     public boolean persistSuccessRecord(EventDetails event) {
         long id = nextId();
         try {
-            int updated = jdbcTemplate.update(INSERT_SQL, ps -> {
+            int updated = jdbcTemplate.update(insertSql, ps -> {
                 setCommonFields(ps, id, event);
                 ps.setString(12, null);
                 ps.setString(13, null);
@@ -192,16 +164,14 @@ public class EventStatusJdbcRepository {
 
     // ---------------------------------------------------------------------
     // Batch insert: FAILED records
-    //  - true  => all rows inserted OR any DuplicateKeyException treated as success
-    //  - false => any other DB error
     // ---------------------------------------------------------------------
     public boolean batchPersistFailedRecords(List<EventDetails> events) {
         if (events == null || events.isEmpty()) {
-            return true; // nothing to insert
+            return true;
         }
 
         try {
-            int[] results = jdbcTemplate.batchUpdate(INSERT_SQL, new BatchPreparedStatementSetter() {
+            int[] results = jdbcTemplate.batchUpdate(insertSql, new BatchPreparedStatementSetter() {
                 @Override
                 public void setValues(PreparedStatement ps, int i) throws SQLException {
                     EventDetails event = events.get(i);
@@ -235,16 +205,14 @@ public class EventStatusJdbcRepository {
 
     // ---------------------------------------------------------------------
     // Batch insert: SUCCESS records
-    //  - true  => all rows inserted OR DuplicateKeyException treated as success
-    //  - false => any other DB error
     // ---------------------------------------------------------------------
     public boolean batchPersistSuccessRecords(List<EventDetails> events) {
         if (events == null || events.isEmpty()) {
-            return true; // nothing to insert
+            return true;
         }
 
         try {
-            int[] results = jdbcTemplate.batchUpdate(INSERT_SQL, new BatchPreparedStatementSetter() {
+            int[] results = jdbcTemplate.batchUpdate(insertSql, new BatchPreparedStatementSetter() {
                 @Override
                 public void setValues(PreparedStatement ps, int i) throws SQLException {
                     EventDetails event = events.get(i);
@@ -277,7 +245,7 @@ public class EventStatusJdbcRepository {
     }
 
     // ---------------------------------------------------------------------
-    // Batch helper: check that all batched statements succeeded
+    // Batch helper
     // ---------------------------------------------------------------------
     private boolean allBatchSucceeded(int[] results, int expectedSize) {
         if (results == null || results.length != expectedSize) {
@@ -286,7 +254,6 @@ public class EventStatusJdbcRepository {
             return false;
         }
         for (int count : results) {
-            // EXECUTE_FAILED = -3; SUCCESS_NO_INFO = -2; positive = rows affected
             if (count == Statement.EXECUTE_FAILED) {
                 return false;
             }
@@ -296,20 +263,18 @@ public class EventStatusJdbcRepository {
 
     // ---------------------------------------------------------------------
     // Common fields for success/failure
-    // sourcePayload & transformedPayload are JsonNode
     // ---------------------------------------------------------------------
     private void setCommonFields(PreparedStatement ps, long id, EventDetails event) throws SQLException {
         ps.setLong(1, id);
         ps.setString(2, event.getEventTraceId());
         ps.setString(3, event.getAccountNumber());
         ps.setString(4, event.getCustomerType());
-        ps.setLong(5, event.getTimestamp());    // epoch millis -> event_timestamp_ms
+        ps.setLong(5, event.getTimestamp());    // epoch millis
         ps.setString(6, event.getTopic());
         ps.setInt(7, event.getPartition());
         ps.setLong(8, event.getOffset());
         ps.setString(9, event.getKey());
 
-        // JsonNode -> JSON string
         ps.setString(10, toJson(event.getSourcePayload()));
         ps.setString(11, toJson(event.getTransformedPayload()));
     }
