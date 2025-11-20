@@ -1,5 +1,57 @@
 /*
 ==========================
+= 1) SQL DDL (MariaDB)   =
+==========================
+
+Use this to create the table (or adjust your existing one).
+
+CREATE TABLE event_details (
+    id                 BIGINT UNSIGNED NOT NULL,
+
+    event_trace_id     VARCHAR(100)    NOT NULL,
+    account_number     VARCHAR(64)     NOT NULL,
+    customer_type      VARCHAR(32)     NOT NULL,
+
+    event_timestamp_ms BIGINT          NOT NULL,
+
+    topic              VARCHAR(200)    NOT NULL,
+    partition_id       INT             NOT NULL,
+    kafka_offset       BIGINT          NOT NULL,
+    message_key        VARCHAR(256)    NULL,
+
+    source_payload      MEDIUMTEXT     NULL,
+    transformed_payload MEDIUMTEXT     NULL,
+
+    exception_type     VARCHAR(255)    NULL,
+    exception_message  TEXT            NULL,
+    exception_stack    MEDIUMTEXT      NULL,
+
+    retriable          TINYINT(1)      NOT NULL DEFAULT 0,
+    retry_attempt      INT             NOT NULL DEFAULT 0,
+
+    status             VARCHAR(20)     NOT NULL DEFAULT 'SUCCESS',
+
+    created_at         DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    updated_at         DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+                                          ON UPDATE CURRENT_TIMESTAMP(3),
+
+    PRIMARY KEY (id),
+
+    UNIQUE KEY uk_topic_partition_offset (topic, partition_id, kafka_offset),
+    KEY idx_account_number (account_number),
+    KEY idx_event_trace_id (event_trace_id),
+    KEY idx_partition (partition_id),
+    KEY idx_kafka_offset (kafka_offset)
+) ENGINE = InnoDB
+  DEFAULT CHARSET = utf8mb4
+  COLLATE = utf8mb4_unicode_ci;
+
+-- If table already exists, just add status:
+-- ALTER TABLE event_details
+--   ADD COLUMN status VARCHAR(20) NOT NULL DEFAULT 'SUCCESS' AFTER retry_attempt;
+
+
+==========================
 = 1) application.yml     =
 ==========================
 
