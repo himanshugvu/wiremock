@@ -1,227 +1,195 @@
-package com.orchestrator.wiremock.config;
+package com.example.demo;
 
-import io.micrometer.core.instrument.MeterRegistry;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.apache.hc.client5.http.ConnectionKeepAliveStrategy;
-import org.apache.hc.client5.http.HttpRequestRetryStrategy;
-import org.apache.hc.client5.http.config.ConnectionConfig;
-import org.apache.hc.client5.http.config.RequestConfig;
-import org.apache.hc.client5.http.impl.DefaultHttpRequestRetryStrategy;
-import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
-import org.apache.hc.client5.http.impl.classic.HttpClients;
-import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManager;
-import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder;
-import org.apache.hc.core5.http.HeaderElement;
-import org.apache.hc.core5.http.HttpResponse;
-import org.apache.hc.core5.http.message.BasicHeaderElementIterator;
-import org.apache.hc.core5.http.protocol.HttpContext;
-import org.apache.hc.core5.util.TimeValue;
-import org.apache.hc.core5.util.Timeout;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
+import org.apache.kafka.clients.producer.RecordMetadata;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.jdbc.core.BatchPreparedStatementSetter;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.support.SendResult;
+import org.springframework.stereotype.Service;
 
-import java.io.IOException;
-import java.util.concurrent.TimeUnit;
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Executors;
 
-/**
- * Production-grade Apache HttpClient5 configuration with connection pooling.
- *
- * Features:
- * - Connection pooling with configurable max connections
- * - Stale connection checking
- * - Connection eviction for idle connections
- * - Retry strategy with exponential backoff
- * - Keep-alive strategy
- * - Comprehensive timeout configuration
- * - Metrics integration
- */
-@Slf4j
-@Configuration
-@RequiredArgsConstructor
-public class HttpClientConfiguration {
+@Service
+public class EventProcessingService {
 
-    private final HttpClientProperties properties;
-    private final MeterRegistry meterRegistry;
+    private static final Logger log = LoggerFactory.getLogger(EventProcessingService.class);
 
-    /**
-     * Creates a pooling connection manager with production-grade settings.
-     *
-     * Key features:
-     * - Connection validation after inactivity
-     * - Configurable max connections per route and total
-     * - Connection and socket timeout configuration
-     */
-    @Bean
-    public PoolingHttpClientConnectionManager poolingConnectionManager() {
-        log.info("Initializing PoolingHttpClientConnectionManager with maxTotal={}, maxPerRoute={}",
-                properties.getConnection().getPool().getMaxTotal(),
-                properties.getConnection().getPool().getMaxPerRoute());
+    private static final String INSERT_SQL =
+            "INSERT INTO event_status (id, payload, status, error_message) VALUES (?, ?, ?, ?)";
 
-        ConnectionConfig connectionConfig = ConnectionConfig.custom()
-                .setConnectTimeout(Timeout.ofMilliseconds(properties.getConnection().getTimeout().getConnectMs()))
-                .setSocketTimeout(Timeout.ofMilliseconds(properties.getConnection().getTimeout().getSocketMs()))
-                .setValidateAfterInactivity(TimeValue.ofMilliseconds(
-                        properties.getConnection().getPool().getValidateAfterInactivityMs()))
-                .build();
+    private final KafkaTemplate<String, OutgoingEvent> kafkaTemplate;
+    private final JdbcTemplate jdbcTemplate;
+    private final String topic;
 
-        PoolingHttpClientConnectionManager connectionManager = PoolingHttpClientConnectionManagerBuilder.create()
-                .setMaxConnTotal(properties.getConnection().getPool().getMaxTotal())
-                .setMaxConnPerRoute(properties.getConnection().getPool().getMaxPerRoute())
-                .setDefaultConnectionConfig(connectionConfig)
-                .build();
+    // Virtual-thread executor for async DB writes (fast + cheap concurrency)
+    private final Executor successWriteExecutor =
+            Executors.newThreadPerTaskExecutor(
+                    Thread.ofVirtual().name("success-db-", 0).factory()
+            );
 
-        // Register metrics for connection pool monitoring
-        meterRegistry.gauge("http.client.pool.total.max", connectionManager,
-                cm -> (double) properties.getConnection().getPool().getMaxTotal());
-        meterRegistry.gauge("http.client.pool.total.available", connectionManager,
-                cm -> (double) cm.getTotalStats().getAvailable());
-
-        log.info("Connection pool initialized successfully");
-        return connectionManager;
+    public EventProcessingService(KafkaTemplate<String, OutgoingEvent> kafkaTemplate,
+                                  JdbcTemplate jdbcTemplate,
+                                  @Value("${app.kafka.topic}") String topic) {
+        this.kafkaTemplate = kafkaTemplate;
+        this.jdbcTemplate = jdbcTemplate;
+        this.topic = topic;
     }
 
     /**
-     * Custom retry strategy with exponential backoff.
-     *
-     * Retries on:
-     * - IOException (connection failures)
-     * - Idempotent requests only (GET, HEAD, PUT, DELETE, OPTIONS, TRACE)
+     * Main batch flow:
+     *  - async send all events to Kafka
+     *  - wait for all futures to complete
+     *  - sync batch insert FAILED into MariaDB
+     *  - async batch insert SUCCESS into MariaDB
      */
-    @Bean
-    public HttpRequestRetryStrategy retryStrategy() {
-        if (!properties.getConnection().getRetry().isEnabled()) {
-            log.info("Retry handler disabled");
-            return new DefaultHttpRequestRetryStrategy(0, TimeValue.ZERO_MILLISECONDS);
+    public BatchResult processBatch(List<OutgoingEvent> events) {
+
+        record SendHolder(
+                OutgoingEvent event,
+                CompletableFuture<SendResult<String, OutgoingEvent>> future
+        ) {}
+
+        List<SendHolder> sends = new ArrayList<>(events.size());
+
+        // 1) async sends (Kafka producer itself can retry via config)
+        for (OutgoingEvent event : events) {
+            CompletableFuture<SendResult<String, OutgoingEvent>> future =
+                    kafkaTemplate.send(topic, event.id(), event);
+            sends.add(new SendHolder(event, future));
         }
 
-        int retryCount = properties.getConnection().getRetry().getCount();
-        long retryInterval = properties.getConnection().getRetry().getIntervalMs();
+        // 2) wait for all futures to complete (success OR final failure)
+        CompletableFuture<?>[] futuresArray =
+                sends.stream().map(SendHolder::future).toArray(CompletableFuture[]::new);
 
-        log.info("Configuring retry strategy: count={}, interval={}ms", retryCount, retryInterval);
+        CompletableFuture.allOf(futuresArray)
+                .exceptionally(ex -> {
+                    log.warn("Some Kafka sends completed exceptionally at allOf level", ex);
+                    return null;
+                })
+                .join(); // safe from platform or virtual thread
 
-        return new DefaultHttpRequestRetryStrategy(
-                retryCount,
-                TimeValue.ofMilliseconds(retryInterval)
-        ) {
+        // 3) partition successes and failures
+        List<OutgoingEvent> successEvents = new ArrayList<>();
+        List<FailedEvent> failedEvents = new ArrayList<>();
+
+        for (SendHolder holder : sends) {
+            holder.future()
+                    .handle((sendResult, ex) -> {
+                        if (ex != null) {
+                            log.error("Kafka send FAILED for eventId={}", holder.event().id(), ex);
+                            failedEvents.add(new FailedEvent(holder.event(), truncate(ex.getMessage(), 1000)));
+                        } else {
+                            RecordMetadata meta = sendResult.getRecordMetadata();
+                            log.debug("Kafka send OK eventId={} topic={} partition={} offset={}",
+                                      holder.event().id(),
+                                      meta.topic(),
+                                      meta.partition(),
+                                      meta.offset());
+                            successEvents.add(holder.event());
+                        }
+                        return null;
+                    })
+                    .join();
+        }
+
+        // 4) sync batch insert for failed events (caller waits)
+        if (!failedEvents.isEmpty()) {
+            batchInsertFailed(failedEvents);
+        }
+
+        // 5) async batch insert for successful events (caller does NOT wait)
+        if (!successEvents.isEmpty()) {
+            CompletableFuture.runAsync(
+                    () -> batchInsertSuccess(successEvents),
+                    successWriteExecutor
+            ).exceptionally(ex -> {
+                log.error("Async batch insert for successful events FAILED", ex);
+                return null;
+            });
+        }
+
+        return new BatchResult(
+                events.size(),
+                successEvents.size(),
+                failedEvents.size()
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Batch insert helpers (MariaDB via JdbcTemplate)
+    // -------------------------------------------------------------------------
+
+    private void batchInsertFailed(List<FailedEvent> failedEvents) {
+        jdbcTemplate.batchUpdate(INSERT_SQL, new BatchPreparedStatementSetter() {
             @Override
-            public boolean retryRequest(
-                    final org.apache.hc.core5.http.HttpRequest request,
-                    final IOException exception,
-                    final int execCount,
-                    final HttpContext context) {
-
-                boolean shouldRetry = super.retryRequest(request, exception, execCount, context);
-
-                if (shouldRetry) {
-                    log.warn("Retrying request (attempt {}/{}): {} - Exception: {}",
-                            execCount, retryCount, request.getRequestUri(), exception.getMessage());
-                    meterRegistry.counter("http.client.retry",
-                            "exception", exception.getClass().getSimpleName()).increment();
-                } else {
-                    log.error("Not retrying request after {} attempts: {} - Exception: {}",
-                            execCount, request.getRequestUri(), exception.getMessage());
-                }
-
-                return shouldRetry;
-            }
-        };
-    }
-
-    /**
-     * Custom keep-alive strategy.
-     *
-     * Uses server-provided Keep-Alive header if available,
-     * otherwise falls back to configured default.
-     */
-    @Bean
-    public ConnectionKeepAliveStrategy keepAliveStrategy() {
-        if (!properties.getConnection().getKeepAlive().isEnabled()) {
-            log.info("Keep-alive strategy disabled");
-            return (response, context) -> TimeValue.ZERO_MILLISECONDS;
-        }
-
-        long defaultKeepAlive = properties.getConnection().getKeepAlive().getDurationMs();
-        log.info("Configuring keep-alive strategy: default duration={}ms", defaultKeepAlive);
-
-        return (HttpResponse response, HttpContext context) -> {
-            // Honor 'keep-alive' header if present
-            BasicHeaderElementIterator it = new BasicHeaderElementIterator(
-                    response.headerIterator("Keep-Alive"));
-
-            while (it.hasNext()) {
-                HeaderElement element = it.next();
-                String param = element.getName();
-                String value = element.getValue();
-
-                if (value != null && param.equalsIgnoreCase("timeout")) {
-                    try {
-                        long serverKeepAlive = Long.parseLong(value) * 1000;
-                        log.debug("Using server-provided keep-alive: {}ms", serverKeepAlive);
-                        return TimeValue.ofMilliseconds(serverKeepAlive);
-                    } catch (NumberFormatException e) {
-                        log.warn("Invalid keep-alive timeout value: {}", value);
-                    }
-                }
+            public void setValues(PreparedStatement ps, int i) throws SQLException {
+                FailedEvent fe = failedEvents.get(i);
+                ps.setString(1, fe.event().id());
+                ps.setString(2, fe.event().payload());
+                ps.setString(3, "FAILED");
+                ps.setString(4, fe.errorMessage());
             }
 
-            // Fall back to default
-            log.debug("Using default keep-alive: {}ms", defaultKeepAlive);
-            return TimeValue.ofMilliseconds(defaultKeepAlive);
-        };
+            @Override
+            public int getBatchSize() {
+                return failedEvents.size();
+            }
+        });
     }
 
-    /**
-     * Closeable HTTP client with all production-grade configurations.
-     *
-     * Features:
-     * - Connection pooling
-     * - Retry strategy
-     * - Keep-alive strategy
-     * - Request timeout configuration
-     * - Connection eviction
-     */
-    @Bean
-    public CloseableHttpClient httpClient(
-            PoolingHttpClientConnectionManager connectionManager,
-            HttpRequestRetryStrategy retryStrategy,
-            ConnectionKeepAliveStrategy keepAliveStrategy) {
+    private void batchInsertSuccess(List<OutgoingEvent> successEvents) {
+        jdbcTemplate.batchUpdate(INSERT_SQL, new BatchPreparedStatementSetter() {
+            @Override
+            public void setValues(PreparedStatement ps, int i) throws SQLException {
+                OutgoingEvent ev = successEvents.get(i);
+                ps.setString(1, ev.id());
+                ps.setString(2, ev.payload());
+                ps.setString(3, "SUCCESS");
+                ps.setString(4, null); // no error message
+            }
 
-        log.info("Building CloseableHttpClient with production-grade configuration");
-
-        RequestConfig requestConfig = RequestConfig.custom()
-                .setConnectionRequestTimeout(Timeout.ofMilliseconds(
-                        properties.getConnection().getTimeout().getConnectionRequestMs()))
-                .setResponseTimeout(Timeout.ofMilliseconds(
-                        properties.getConnection().getTimeout().getSocketMs()))
-                .build();
-
-        CloseableHttpClient httpClient = HttpClients.custom()
-                .setConnectionManager(connectionManager)
-                .setRetryStrategy(retryStrategy)
-                .setKeepAliveStrategy(keepAliveStrategy)
-                .setDefaultRequestConfig(requestConfig)
-                .evictIdleConnections(TimeValue.ofMilliseconds(
-                        properties.getConnection().getPool().getEvictIdleConnectionsAfterMs()))
-                .build();
-
-        log.info("CloseableHttpClient built successfully");
-        return httpClient;
+            @Override
+            public int getBatchSize() {
+                return successEvents.size();
+            }
+        });
     }
 
-    /**
-     * HTTP request factory for Spring's RestClient/RestTemplate.
-     */
-    @Bean
-    public HttpComponentsClientHttpRequestFactory requestFactory(CloseableHttpClient httpClient) {
-        HttpComponentsClientHttpRequestFactory factory = new HttpComponentsClientHttpRequestFactory(httpClient);
-
-        // Note: Timeouts are already configured in the HttpClient itself
-        // These are legacy settings for compatibility
-        factory.setConnectTimeout((int) properties.getConnection().getTimeout().getConnectMs());
-
-        log.info("HttpComponentsClientHttpRequestFactory created");
-        return factory;
+    private String truncate(String s, int max) {
+        if (s == null) return null;
+        return (s.length() <= max) ? s : s.substring(0, max);
     }
+
+    // -------------------------------------------------------------------------
+    // Simple DTOs / records (can be moved out if you prefer)
+    // -------------------------------------------------------------------------
+
+    // Event you send to Kafka
+    public record OutgoingEvent(
+            String id,
+            String payload
+    ) {}
+
+    // Internal holder for failed events (event + error)
+    private record FailedEvent(
+            OutgoingEvent event,
+            String errorMessage
+    ) {}
+
+    // Summary returned to caller
+    public record BatchResult(
+            int total,
+            int successCount,
+            int failureCount
+    ) {}
 }
