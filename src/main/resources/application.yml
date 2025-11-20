@@ -1,28 +1,65 @@
-kafka:
-  producer:
-    # --- REQUIRED / ENV-SPECIFIC ---
-    bootstrapServers: "PLAINTEXT://kafka:9092"   # override per environment
-    targetTopic: "payments-processed"
+spring:
+  application:
+    name: event-processor
 
-    # --- Delivery Semantics ---
-    acks: "all"                      # strongest durability guarantee
-    idempotence: true                # ensures ordering & prevents duplicates
-    retries: 2147483647              # Integer.MAX_VALUE
-    maxInFlightRequestsPerConnection: 5
-    retryBackoffMs: 100              # ms backoff before retrying
+  datasource:
+    # MariaDB JDBC URL – adjust host, port, db name
+    url: jdbc:mariadb://mariadb-host:3306/your_db_name
+    username: your_db_user
+    password: your_db_password
+    driver-class-name: org.mariadb.jdbc.Driver
 
-    # --- Batching & Compression ---
-    batchSizeBytes: 32768            # 32 KB (tuned for throughput)
-    lingerMs: 10                     # small wait before batching
-    compressionType: "lz4"           # fast & efficient compression
+    # HikariCP settings
+    hikari:
+      pool-name: event-db-pool
+      maximum-pool-size: 30        # tune based on CPU + DB connections
+      minimum-idle: 10
+      idle-timeout: 600000         # 10 minutes
+      max-lifetime: 1800000        # 30 minutes (slightly less than DB timeout)
+      connection-timeout: 30000    # 30 seconds
+      leak-detection-threshold: 0  # set e.g. 20000 ms if you suspect leaks
 
-    # --- Timeouts & Buffers ---
-    requestTimeoutMs: 30000          # request-level timeout
-    deliveryTimeoutMs: 120000        # full send-cycle timeout
-    bufferMemoryBytes: 67108864      # 64 MB producer buffer
+      # Optional: keepalive to prevent idle connections being killed by network/DB
+      keepalive-time: 300000       # 5 minutes
 
-    # --- Per-record Await Timeout (Consumer-Side) ---
-    sendTimeoutMs: 60000             # max wait for send future
+  jpa:
+    # If you're not using JPA, you can remove this block. Left here for safety.
+    hibernate:
+      ddl-auto: none
+    open-in-view: false
 
-    # --- Headers ---
-    copyHeaders: true
+  # If you use Flyway or Liquibase, configure here (optional)
+  flyway:
+    enabled: false
+
+# ------- Logging (optional but useful for DB/Kafka debugging) -------
+logging:
+  level:
+    root: INFO
+    org.springframework.jdbc.core.JdbcTemplate: DEBUG
+    org.springframework.jdbc.datasource: DEBUG
+    com.example.messaging.repository.EventStatusJdbcRepository: DEBUG
+
+# ------- App-specific config -------
+app:
+  # Table name used by EventStatusJdbcRepository (injected via @Value)
+  event-details-table: event_details
+
+  # Toggle this if you later add Tsid.fast() vs TsidCreator.getTsid() logic
+  tsid:
+    fast: false
+
+# ------- TSID node configuration -------
+# TSID reads node from either:
+#   - System property: -Dtsidcreator.node=<int>
+#   - Env var:         TSIDCREATOR_NODE=<int>
+#
+# In Kubernetes/OCP, you typically set TSIDCREATOR_NODE via env on the pod.
+#
+# Example for local dev (uncomment if you like using system properties via Spring):
+#
+# tsid:
+#   node: 1
+#
+# And start JVM with:
+#   -Dtsidcreator.node=${tsid.node}
