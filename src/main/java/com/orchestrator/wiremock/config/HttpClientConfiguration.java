@@ -1,3 +1,62 @@
+/*
+==========================
+= 1) SQL DDL (MariaDB)   =
+==========================
+
+Use this to create the table (or adjust your existing one).
+
+CREATE TABLE event_details (
+    id                 BIGINT UNSIGNED NOT NULL,
+
+    event_trace_id     VARCHAR(100)    NOT NULL,
+    account_number     VARCHAR(64)     NOT NULL,
+    customer_type      VARCHAR(32)     NOT NULL,
+
+    event_timestamp_ms BIGINT          NOT NULL,
+
+    topic              VARCHAR(200)    NOT NULL,
+    partition_id       INT             NOT NULL,
+    kafka_offset       BIGINT          NOT NULL,
+    message_key        VARCHAR(256)    NULL,
+
+    source_payload      MEDIUMTEXT     NULL,
+    transformed_payload MEDIUMTEXT     NULL,
+
+    exception_type     VARCHAR(255)    NULL,
+    exception_message  TEXT            NULL,
+    exception_stack    MEDIUMTEXT      NULL,
+
+    retriable          TINYINT(1)      NOT NULL DEFAULT 0,
+    retry_attempt      INT             NOT NULL DEFAULT 0,
+
+    status             VARCHAR(20)     NOT NULL DEFAULT 'SUCCESS',
+
+    created_at         DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    updated_at         DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+                                          ON UPDATE CURRENT_TIMESTAMP(3),
+
+    PRIMARY KEY (id),
+
+    UNIQUE KEY uk_topic_partition_offset (topic, partition_id, kafka_offset),
+    KEY idx_account_number (account_number),
+    KEY idx_event_trace_id (event_trace_id),
+    KEY idx_partition (partition_id),
+    KEY idx_kafka_offset (kafka_offset)
+) ENGINE = InnoDB
+  DEFAULT CHARSET = utf8mb4
+  COLLATE = utf8mb4_unicode_ci;
+
+-- If table already exists, just add status:
+-- ALTER TABLE event_details
+--   ADD COLUMN status VARCHAR(20) NOT NULL DEFAULT 'SUCCESS' AFTER retry_attempt;
+
+
+
+==========================================
+= 2) Spring JDBC repository with enum   =
+==========================================
+*/
+
 package com.example.messaging.repository;
 
 import com.example.messaging.model.EventDetails;
@@ -5,6 +64,10 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.f4b6a3.tsid.TsidCreator;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataAccessException;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.BatchPreparedStatementSetter;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
@@ -16,6 +79,8 @@ import java.util.List;
 
 @Repository
 public class EventStatusJdbcRepository {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(EventStatusJdbcRepository.class);
 
     private static final String INSERT_SQL = """
         INSERT INTO event_details (
@@ -34,8 +99,9 @@ public class EventStatusJdbcRepository {
             exception_message,
             exception_stack,
             retriable,
-            retry_attempt
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            retry_attempt,
+            status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """;
 
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
@@ -47,6 +113,19 @@ public class EventStatusJdbcRepository {
     }
 
     // ---------------------------------------------------------------------
+    // Status enum (backed by VARCHAR(20) in DB)
+    // Includes your requested values + SUCCESS/FAILED for terminal state.
+    // ---------------------------------------------------------------------
+    public enum EventStatus {
+        SUCCESS,
+        FAILED,
+        PENDING,
+        RETRIED,
+        SKIPPED,
+        PARTIAL
+    }
+
+    // ---------------------------------------------------------------------
     // TSID generator wrapper (64-bit time-ordered ID)
     // ---------------------------------------------------------------------
     private long nextId() {
@@ -55,101 +134,146 @@ public class EventStatusJdbcRepository {
     }
 
     // ---------------------------------------------------------------------
-    // Single insert: FAILED record  -> returns true if 1 row inserted
+    // Single insert: FAILED record
+    //  - true  => row inserted OR duplicate key (unique constraint) treated as success
+    //  - false => any other DB error
     // ---------------------------------------------------------------------
     public boolean persistFailedRecord(EventDetails event) {
         long id = nextId();
-
-        int updated = jdbcTemplate.update(INSERT_SQL, ps -> {
-            setCommonFields(ps, id, event);
-            ps.setString(12, event.getExceptionType());
-            ps.setString(13, event.getExceptionMessage());
-            ps.setString(14, event.getExceptionStack());
-            ps.setBoolean(15, event.isRetriable());
-            ps.setInt(16, event.getRetryAttempt());
-        });
-
-        return updated == 1;
-    }
-
-    // ---------------------------------------------------------------------
-    // Single insert: SUCCESS record -> returns true if 1 row inserted
-    // ---------------------------------------------------------------------
-    public boolean persistSuccessRecord(EventDetails event) {
-        long id = nextId();
-
-        int updated = jdbcTemplate.update(INSERT_SQL, ps -> {
-            setCommonFields(ps, id, event);
-            ps.setString(12, null);
-            ps.setString(13, null);
-            ps.setString(14, null);
-            ps.setBoolean(15, false); // success not retriable
-            ps.setInt(16, event.getRetryAttempt() != null ? event.getRetryAttempt() : 0);
-        });
-
-        return updated == 1;
-    }
-
-    // ---------------------------------------------------------------------
-    // Batch insert: FAILED records -> true if all succeeded
-    // ---------------------------------------------------------------------
-    public boolean batchPersistFailedRecords(List<EventDetails> events) {
-        if (events == null || events.isEmpty()) {
-            return true; // nothing to insert = trivially OK
-        }
-
-        int[] results = jdbcTemplate.batchUpdate(INSERT_SQL, new BatchPreparedStatementSetter() {
-            @Override
-            public void setValues(PreparedStatement ps, int i) throws SQLException {
-                EventDetails event = events.get(i);
-                long id = nextId();
-
+        try {
+            int updated = jdbcTemplate.update(INSERT_SQL, ps -> {
                 setCommonFields(ps, id, event);
                 ps.setString(12, event.getExceptionType());
                 ps.setString(13, event.getExceptionMessage());
                 ps.setString(14, event.getExceptionStack());
                 ps.setBoolean(15, event.isRetriable());
                 ps.setInt(16, event.getRetryAttempt());
-            }
-
-            @Override
-            public int getBatchSize() {
-                return events.size();
-            }
-        });
-
-        return allBatchSucceeded(results, events.size());
+                ps.setString(17, EventStatus.FAILED.name());
+            });
+            return updated == 1;
+        } catch (DuplicateKeyException ex) {
+            // Unique constraint violation => treat as logical success (idempotent)
+            LOGGER.info("Duplicate key on persistFailedRecord (treating as success). eventTraceId={}",
+                    event.getEventTraceId(), ex);
+            return true;
+        } catch (DataAccessException ex) {
+            LOGGER.error("DB error on persistFailedRecord. eventTraceId={}", event.getEventTraceId(), ex);
+            return false;
+        }
     }
 
     // ---------------------------------------------------------------------
-    // Batch insert: SUCCESS records -> true if all succeeded
+    // Single insert: SUCCESS record
+    //  - true  => row inserted OR duplicate key treated as success
+    //  - false => any other DB error
     // ---------------------------------------------------------------------
-    public boolean batchPersistSuccessRecords(List<EventDetails> events) {
-        if (events == null || events.isEmpty()) {
-            return true; // nothing to insert = trivially OK
-        }
-
-        int[] results = jdbcTemplate.batchUpdate(INSERT_SQL, new BatchPreparedStatementSetter() {
-            @Override
-            public void setValues(PreparedStatement ps, int i) throws SQLException {
-                EventDetails event = events.get(i);
-                long id = nextId();
-
+    public boolean persistSuccessRecord(EventDetails event) {
+        long id = nextId();
+        try {
+            int updated = jdbcTemplate.update(INSERT_SQL, ps -> {
                 setCommonFields(ps, id, event);
                 ps.setString(12, null);
                 ps.setString(13, null);
                 ps.setString(14, null);
-                ps.setBoolean(15, false);
+                ps.setBoolean(15, false); // success not retriable
                 ps.setInt(16, event.getRetryAttempt() != null ? event.getRetryAttempt() : 0);
-            }
+                ps.setString(17, EventStatus.SUCCESS.name());
+            });
+            return updated == 1;
+        } catch (DuplicateKeyException ex) {
+            LOGGER.info("Duplicate key on persistSuccessRecord (treating as success). eventTraceId={}",
+                    event.getEventTraceId(), ex);
+            return true;
+        } catch (DataAccessException ex) {
+            LOGGER.error("DB error on persistSuccessRecord. eventTraceId={}", event.getEventTraceId(), ex);
+            return false;
+        }
+    }
 
-            @Override
-            public int getBatchSize() {
-                return events.size();
-            }
-        });
+    // ---------------------------------------------------------------------
+    // Batch insert: FAILED records
+    //  - true  => all rows inserted OR any DuplicateKeyException treated as success
+    //  - false => any other DB error
+    // ---------------------------------------------------------------------
+    public boolean batchPersistFailedRecords(List<EventDetails> events) {
+        if (events == null || events.isEmpty()) {
+            return true; // nothing to insert
+        }
 
-        return allBatchSucceeded(results, events.size());
+        try {
+            int[] results = jdbcTemplate.batchUpdate(INSERT_SQL, new BatchPreparedStatementSetter() {
+                @Override
+                public void setValues(PreparedStatement ps, int i) throws SQLException {
+                    EventDetails event = events.get(i);
+                    long id = nextId();
+
+                    setCommonFields(ps, id, event);
+                    ps.setString(12, event.getExceptionType());
+                    ps.setString(13, event.getExceptionMessage());
+                    ps.setString(14, event.getExceptionStack());
+                    ps.setBoolean(15, event.isRetriable());
+                    ps.setInt(16, event.getRetryAttempt());
+                    ps.setString(17, EventStatus.FAILED.name());
+                }
+
+                @Override
+                public int getBatchSize() {
+                    return events.size();
+                }
+            });
+
+            return allBatchSucceeded(results, events.size());
+        } catch (DuplicateKeyException ex) {
+            LOGGER.info("Duplicate key in batchPersistFailedRecords (treating batch as success). size={}",
+                    events.size(), ex);
+            return true;
+        } catch (DataAccessException ex) {
+            LOGGER.error("DB error in batchPersistFailedRecords. size={}", events.size(), ex);
+            return false;
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Batch insert: SUCCESS records
+    //  - true  => all rows inserted OR DuplicateKeyException treated as success
+    //  - false => any other DB error
+    // ---------------------------------------------------------------------
+    public boolean batchPersistSuccessRecords(List<EventDetails> events) {
+        if (events == null || events.isEmpty()) {
+            return true; // nothing to insert
+        }
+
+        try {
+            int[] results = jdbcTemplate.batchUpdate(INSERT_SQL, new BatchPreparedStatementSetter() {
+                @Override
+                public void setValues(PreparedStatement ps, int i) throws SQLException {
+                    EventDetails event = events.get(i);
+                    long id = nextId();
+
+                    setCommonFields(ps, id, event);
+                    ps.setString(12, null);
+                    ps.setString(13, null);
+                    ps.setString(14, null);
+                    ps.setBoolean(15, false);
+                    ps.setInt(16, event.getRetryAttempt() != null ? event.getRetryAttempt() : 0);
+                    ps.setString(17, EventStatus.SUCCESS.name());
+                }
+
+                @Override
+                public int getBatchSize() {
+                    return events.size();
+                }
+            });
+
+            return allBatchSucceeded(results, events.size());
+        } catch (DuplicateKeyException ex) {
+            LOGGER.info("Duplicate key in batchPersistSuccessRecords (treating batch as success). size={}",
+                    events.size(), ex);
+            return true;
+        } catch (DataAccessException ex) {
+            LOGGER.error("DB error in batchPersistSuccessRecords. size={}", events.size(), ex);
+            return false;
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -157,6 +281,8 @@ public class EventStatusJdbcRepository {
     // ---------------------------------------------------------------------
     private boolean allBatchSucceeded(int[] results, int expectedSize) {
         if (results == null || results.length != expectedSize) {
+            LOGGER.warn("Batch update size mismatch. expected={} actual={}",
+                    expectedSize, results == null ? null : results.length);
             return false;
         }
         for (int count : results) {
